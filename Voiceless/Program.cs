@@ -40,7 +40,7 @@ public class Program
         var builder = new ConfigurationBuilder()
             .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: false, reloadOnChange: true);
+            .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true, reloadOnChange: true);
         _configuration = builder.Build();
 
         _openAi = new OpenAIService(new OpenAiOptions()
