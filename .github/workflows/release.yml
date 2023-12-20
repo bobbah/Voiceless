@@ -43,8 +43,8 @@ jobs:
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   release_id: release.data.id,
-                  name: `${proj}-${rt}.7z`,
-                  data: fs.readFileSync(`publish/${proj}-${rt}.7z`)
+                  name: `${proj}-${rt}.zip`,
+                  data: fs.readFileSync(`publish/${proj}-${rt}.zip`)
                 });
               }
             } 
