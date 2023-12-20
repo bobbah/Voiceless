@@ -1,0 +1,50 @@
+name: release
+on:
+  release:
+    types: [created]
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: 8.0.100
+      - name: Checkout source
+        uses: actions/checkout@v3
+      - name: Prepare publish artifacts
+        run: |
+          dotnet publish Voiceless -o publish/linux-x64/Voiceless/ -r "linux-x64" --self-contained false -c Release --nologo
+          7z a publish/Voiceless-linux-x64.zip -r ./publish/linux-x64/Voiceless/*
+          dotnet publish Voiceless -o publish/win-x64/Voiceless/ -r "win-x64" --self-contained false -c Release --nologo
+          7z a publish/Voiceless-win-x64.zip -r ./publish/win-x64/Voiceless/*
+      - name: Upload release artifacts
+        uses: actions/github-script@v4
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = context.ref.replace("refs/tags/", "");
+            console.log("tag = ", tag);
+            // Get release for this tag
+            const release = await github.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag
+            });
+            const releaseRuntimes = ['linux-x64', 'win-x64'];
+            const projects = ['Voiceless'];
+            for (rt of releaseRuntimes) {
+              for (proj of projects) {
+                // Upload the release asset
+                await github.repos.uploadReleaseAsset({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: release.data.id,
+                  name: `${proj}-${rt}.7z`,
+                  data: fs.readFileSync(`publish/${proj}-${rt}.7z`)
+                });
+              }
+            } 
