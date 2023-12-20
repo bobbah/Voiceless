@@ -31,8 +31,8 @@ jobs:
             console.log("tag = ", tag);
             // Create release
             await github.repos.createRelease({
-              context.repo.owner,
-              context.repo.repo,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
               tag_name: tag,
               name: `Voiceless ${tag}`,
               draft: false,
