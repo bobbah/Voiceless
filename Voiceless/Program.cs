@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using DSharpPlus;
@@ -20,12 +21,16 @@ public class Program
         new Regex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b",
             RegexOptions.Compiled | RegexOptions.Multiline);
 
-    private static Regex _emojiPattern = new Regex(@"<:(?<text>.+):[0-9]+>", RegexOptions.Compiled | RegexOptions.Multiline);
+    private static Regex _emojiPattern =
+        new Regex(@"<:(?<text>.+):[0-9]+>", RegexOptions.Compiled | RegexOptions.Multiline);
+
     private static OpenAIService _openAi = null!;
     private static IConfiguration _configuration = null!;
     private static readonly HashSet<string> AllowedModels = [];
     private static readonly HashSet<string> AllowedVoices = [];
     private static readonly HashSet<string> ImageDetailLevels = [];
+
+    private static readonly ConcurrentQueue<(Stream stream, VoiceNextConnection voiceChannel)> _messageQueue = new();
 
     public static async Task Main(string[] args)
     {
@@ -150,9 +155,20 @@ public class Program
         if (audioResult is not { Successful: true, Data: not null })
             return;
 
-        // Send it out!
-        var transmit = vcChannel.GetTransmitSink();
-        await ConvertAudioToPcm(audioResult.Data, transmit);
+        _messageQueue.Enqueue((audioResult.Data, vcChannel));
+        if (_messageQueue.Count == 1)
+            await ProcessMessageQueue();
+    }
+
+    private static async Task ProcessMessageQueue()
+    {
+        while (_messageQueue.TryDequeue(out var task))
+        {
+            // Send it out!
+            using var transmit = task.voiceChannel.GetTransmitSink();
+            await ConvertAudioToPcm(task.stream, transmit);
+            task.stream.Close();
+        }
     }
 
     private static async Task<string> DescribeAttachments(IEnumerable<DiscordAttachment> attachments)
