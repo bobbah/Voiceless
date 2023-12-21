@@ -165,7 +165,7 @@ public class Program
         while (_messageQueue.TryDequeue(out var task))
         {
             // Send it out!
-            using var transmit = task.voiceChannel.GetTransmitSink();
+            var transmit = task.voiceChannel.GetTransmitSink();
             await ConvertAudioToPcm(task.stream, transmit);
             task.stream.Close();
         }
