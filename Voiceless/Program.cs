@@ -162,12 +162,15 @@ public class Program
 
     private static async Task ProcessMessageQueue()
     {
-        while (_messageQueue.TryDequeue(out var task))
+        while (_messageQueue.TryPeek(out var task))
         {
             // Send it out!
             var transmit = task.voiceChannel.GetTransmitSink();
             await ConvertAudioToPcm(task.stream, transmit);
             task.stream.Close();
+            
+            // Get rid of the item we were processing afterwards
+            _messageQueue.TryDequeue(out _);
         }
     }
 
