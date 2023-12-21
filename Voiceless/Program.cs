@@ -69,7 +69,7 @@ public class Program
 
     private static async Task SessionCreated(DiscordClient sender, SessionReadyEventArgs args)
     {
-        // Check if Victoria is in vc already
+        // Check if target user is in vc already
         var server = await sender.GetGuildAsync(GetServerId());
         
         // Set nickname
@@ -77,10 +77,10 @@ public class Program
         await (await server.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x => x.Nickname = $"{targetUser.Nickname ?? targetUser.DisplayName ?? "Someone"}'s Microphone");
 
         var channels = await server.GetChannelsAsync();
-        var victoriaChannel = channels.FirstOrDefault(x =>
+        var targetChannel = channels.FirstOrDefault(x =>
             x.Type == ChannelType.Voice && x.Users.Any(y => y.Id == GetUserId() && !y.IsDeafened));
-        if (victoriaChannel is not null)
-            await victoriaChannel.ConnectAsync();
+        if (targetChannel is not null)
+            await targetChannel.ConnectAsync();
     }
 
     private static async Task MessageCreated(DiscordClient sender, MessageCreateEventArgs args)
@@ -114,13 +114,6 @@ public class Program
 
         if (audioResult is not { Successful: true, Data: not null })
             return;
-
-        
-        
-        // Save for debug
-        await using var file = File.Create($"{DateTimeOffset.UtcNow.Ticks}.ogg");
-        await audioResult.Data.CopyToAsync(file);
-        file.Close();
         
         // Perform conversion
         var transmit = vcChannel.GetTransmitSink();
