@@ -20,6 +20,7 @@ public class Program
         new Regex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b",
             RegexOptions.Compiled | RegexOptions.Multiline);
 
+    private static Regex _emojiPattern = new Regex(@"<:(?<text>.+):[0-9]+>", RegexOptions.Compiled | RegexOptions.Multiline);
     private static OpenAIService _openAi = null!;
     private static IConfiguration _configuration = null!;
     private static readonly HashSet<string> AllowedModels = [];
@@ -128,9 +129,12 @@ public class Program
                 $" at {args.Guild.GetRole(mention.Id).Name}");
         }
 
+        // Sort out emojis
+        _emojiPattern.Replace(rawMessage, x => x.Groups["text"].Value);
+
         // Strip out URLs
         rawMessage = _urlPattern.Replace(rawMessage, "").Trim();
-        
+
         // Check for attachments to describe
         var imageAttachments = args.Message.Attachments.Where(x => x.MediaType.Contains("image")).ToList();
         if (imageAttachments.Count != 0)
@@ -158,7 +162,7 @@ public class Program
             Messages = new List<ChatMessage>()
             {
                 ChatMessage.FromSystem(
-                    "You summarize the content of images to describe to vision-impared persons. Your summarizations are turned into audio, and should be short and concise. Include the total count of the images at the start."),
+                    "Provide a brief, clear description of each image, focusing on the main subjects and their context. Describe only the most prominent and relevant elements, avoiding detailed or complex descriptions. Summarize each scene in one or two sentences, emphasizing what is essential for understanding the image's primary content and context. Include the total count of the images at the start."),
                 ChatMessage.FromUser(attachments.Select(x =>
                         MessageContent.ImageUrlContent(x.Url, GetAttachmentDetail()))
                     .ToList())
