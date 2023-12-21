@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using DSharpPlus;
+using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
 using DSharpPlus.VoiceNext;
 using Microsoft.Extensions.Configuration;
@@ -14,10 +16,15 @@ namespace Voiceless;
 
 public class Program
 {
+    private static Regex _urlPattern =
+        new Regex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b",
+            RegexOptions.Compiled | RegexOptions.Multiline);
+
     private static OpenAIService _openAi = null!;
     private static IConfiguration _configuration = null!;
     private static readonly HashSet<string> AllowedModels = [];
     private static readonly HashSet<string> AllowedVoices = [];
+    private static readonly HashSet<string> ImageDetailLevels = [];
 
     public static async Task Main(string[] args)
     {
@@ -29,13 +36,23 @@ public class Program
                 propertyValue.StartsWith("tts", StringComparison.InvariantCultureIgnoreCase))
                 AllowedModels.Add(propertyValue);
         }
-        foreach (var property in typeof(StaticValues.AudioStatics.Voice).GetProperties(BindingFlags.Public | BindingFlags.Static))
+
+        foreach (var property in typeof(StaticValues.AudioStatics.Voice).GetProperties(BindingFlags.Public |
+                     BindingFlags.Static))
         {
             var propertyValue = (string?)property.GetValue(null);
             if (property.PropertyType == typeof(string) && !string.IsNullOrWhiteSpace(propertyValue))
                 AllowedVoices.Add(propertyValue);
         }
-        
+
+        foreach (var property in typeof(StaticValues.ImageStatics.ImageDetailTypes).GetProperties(BindingFlags.Public |
+                     BindingFlags.Static))
+        {
+            var propertyValue = (string?)property.GetValue(null);
+            if (property.PropertyType == typeof(string) && !string.IsNullOrWhiteSpace(propertyValue))
+                ImageDetailLevels.Add(propertyValue);
+        }
+
         // Get config
         var builder = new ConfigurationBuilder()
             .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
@@ -71,10 +88,11 @@ public class Program
     {
         // Check if target user is in vc already
         var server = await sender.GetGuildAsync(GetServerId());
-        
+
         // Set nickname
         var targetUser = await server.GetMemberAsync(GetUserId());
-        await (await server.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x => x.Nickname = $"{targetUser.Nickname ?? targetUser.DisplayName ?? "Someone"}'s Microphone");
+        await (await server.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x =>
+            x.Nickname = $"{targetUser.Nickname ?? targetUser.DisplayName ?? "Someone"}'s Microphone");
 
         var channels = await server.GetChannelsAsync();
         var targetChannel = channels.FirstOrDefault(x =>
@@ -110,14 +128,49 @@ public class Program
                 $" at {args.Guild.GetRole(mention.Id).Name}");
         }
 
-        var audioResult = await RunTTS(rawMessage);
+        // Strip out URLs
+        rawMessage = _urlPattern.Replace(rawMessage, "").Trim();
+        
+        // Check for attachments to describe
+        var imageAttachments = args.Message.Attachments.Where(x => x.MediaType.Contains("image")).ToList();
+        if (imageAttachments.Count != 0)
+            rawMessage += (string.IsNullOrWhiteSpace(rawMessage) ? string.Empty : ". ") +
+                          await DescribeAttachments(imageAttachments);
 
+        // Abort here if it's a basically blank message
+        if (string.IsNullOrWhiteSpace(rawMessage))
+            return;
+
+        // Perform TTS conversion
+        var audioResult = await RunTTS(rawMessage);
         if (audioResult is not { Successful: true, Data: not null })
             return;
-        
-        // Perform conversion
+
+        // Send it out!
         var transmit = vcChannel.GetTransmitSink();
         await ConvertAudioToPcm(audioResult.Data, transmit);
+    }
+
+    private static async Task<string> DescribeAttachments(IEnumerable<DiscordAttachment> attachments)
+    {
+        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest()
+        {
+            Messages = new List<ChatMessage>()
+            {
+                ChatMessage.FromSystem(
+                    "You summarize the content of images to describe to vision-impared persons. Your summarizations are turned into audio, and should be short and concise. Include the total count of the images at the start."),
+                ChatMessage.FromUser(attachments.Select(x =>
+                        MessageContent.ImageUrlContent(x.Url, GetAttachmentDetail()))
+                    .ToList())
+            },
+            MaxTokens = GetMaxAttachmentTokens(),
+            Model = Models.Gpt_4_vision_preview,
+            N = 1
+        });
+
+        return completionResult.Successful
+            ? (completionResult.Choices.First().Message.Content ?? "Attachment analysis API returned a null response")
+            : "Failed to describe attached images.";
     }
 
     private static async Task<AudioCreateSpeechResponse<Stream>> RunTTS(string text) =>
@@ -144,11 +197,11 @@ public class Program
                 // Dont do anything if we're already in the channel
                 if (existingConnection.TargetChannel.Id == args.After.Channel.Id)
                     return;
-                
+
                 // Otherwise disconnect from this old one
                 existingConnection.Disconnect();
             }
-            
+
             // Connect to the new channel
             await args.Channel.ConnectAsync();
         }
@@ -208,7 +261,7 @@ public class Program
         => ulong.TryParse(_configuration["target:text_channel"], out var userId)
             ? userId
             : throw new InvalidOperationException("Target text channel ID is missing or invalid");
-    
+
     private static string GetVoiceModel()
     {
         var configured = _configuration["openai:model"];
@@ -226,4 +279,18 @@ public class Program
                 $"Configured voice is invalid or missing. Valid voices: {string.Join(", ", AllowedVoices)}");
         return configured;
     }
+
+    private static string GetAttachmentDetail()
+    {
+        var configured = _configuration["openai:attachment_detail"];
+        if (configured == null || !ImageDetailLevels.Contains(configured))
+            throw new InvalidOperationException(
+                $"Attachment detail level is invalid or missing. Valid levels: {string.Join(", ", ImageDetailLevels)}");
+        return configured;
+    }
+
+    private static int GetMaxAttachmentTokens() =>
+        int.TryParse(_configuration["openai:max_attachment_tokens"], out var attachmentTokens)
+            ? attachmentTokens
+            : throw new InvalidOperationException("Max attachment tokens is missing or invalid");
 }
