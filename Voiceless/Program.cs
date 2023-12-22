@@ -144,11 +144,17 @@ public class Program
         var imageAttachments = args.Message.Attachments.Where(x => x.MediaType.Contains("image")).ToList();
         if (imageAttachments.Count != 0)
             rawMessage += (string.IsNullOrWhiteSpace(rawMessage) ? string.Empty : ". ") +
-                          await DescribeAttachments(imageAttachments);
+                          (GetDescriptiveAttachments()
+                              ? await DescribeAttachments(imageAttachments)
+                              : $"I've attached {imageAttachments.Count} images to my post.");
 
         // Abort here if it's a basically blank message
         if (string.IsNullOrWhiteSpace(rawMessage))
             return;
+
+        // Perform punctuation correction if enabled
+        if (GetFixPunctuation())
+            rawMessage = await FixPunctuation(rawMessage);
 
         // Perform TTS conversion
         var audioResult = await RunTTS(rawMessage);
@@ -160,6 +166,24 @@ public class Program
             await ProcessMessageQueue();
     }
 
+    private static async Task<string> FixPunctuation(string rawMessage)
+    {
+        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest()
+        {
+            Messages = new List<ChatMessage>()
+            {
+                ChatMessage.FromSystem(
+                    "You are a system that inserts and corrects punctuation in provided English text. You also correct excessive whitespace. You do not modify the original meaning or words of the text. You only insert punctuation where necessary. The tone of the resulting punctuation should be neutral."),
+                ChatMessage.FromUser(rawMessage)
+            },
+            Model = Models.Gpt_4_1106_preview
+        });
+
+        return completionResult.Successful
+            ? (completionResult.Choices.First().Message.Content ?? "Punctuation correction returned a null response")
+            : "Failed to correct punctuation.";
+    }
+
     private static async Task ProcessMessageQueue()
     {
         while (_messageQueue.TryPeek(out var task))
@@ -168,7 +192,7 @@ public class Program
             var transmit = task.voiceChannel.GetTransmitSink();
             await ConvertAudioToPcm(task.stream, transmit);
             task.stream.Close();
-            
+
             // Get rid of the item we were processing afterwards
             _messageQueue.TryDequeue(out _);
         }
@@ -316,4 +340,14 @@ public class Program
         int.TryParse(_configuration["openai:max_attachment_tokens"], out var attachmentTokens)
             ? attachmentTokens
             : throw new InvalidOperationException("Max attachment tokens is missing or invalid");
+
+    private static bool GetDescriptiveAttachments() =>
+        bool.TryParse(_configuration["openai:describe_attachments"], out var descriptiveAttachments)
+            ? descriptiveAttachments
+            : throw new InvalidOperationException("Describe attachments flag is missing or invalid");
+
+    private static bool GetFixPunctuation() =>
+        bool.TryParse(_configuration["openai:process_punctuation"], out var fixPunctuation)
+            ? fixPunctuation
+            : throw new InvalidOperationException("Fix punctuation flag is missing or invalid");
 }
