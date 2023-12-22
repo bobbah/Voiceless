@@ -152,9 +152,10 @@ public class Program
         if (string.IsNullOrWhiteSpace(rawMessage))
             return;
 
-        // Perform punctuation correction if enabled
-        if (GetFixPunctuation())
-            rawMessage = await FixPunctuation(rawMessage);
+        // Apply flavor prompt if it is provided
+        var flavorPrompt = GetFlavorPrompt();
+        if (flavorPrompt != string.Empty)
+            rawMessage = await ApplyFlavorPrompt(rawMessage);
 
         // Perform TTS conversion
         var audioResult = await RunTTS(rawMessage);
@@ -166,22 +167,21 @@ public class Program
             await ProcessMessageQueue();
     }
 
-    private static async Task<string> FixPunctuation(string rawMessage)
+    private static async Task<string> ApplyFlavorPrompt(string rawMessage)
     {
         var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest()
         {
             Messages = new List<ChatMessage>()
             {
-                ChatMessage.FromSystem(
-                    "You are a system that inserts and corrects punctuation in provided English text. You also correct excessive whitespace. You do not modify the original meaning or words of the text. You only insert punctuation where necessary. The tone of the resulting punctuation should be neutral."),
+                ChatMessage.FromSystem(GetFlavorPrompt()),
                 ChatMessage.FromUser(rawMessage)
             },
             Model = Models.Gpt_4_1106_preview
         });
 
         return completionResult.Successful
-            ? (completionResult.Choices.First().Message.Content ?? "Punctuation correction returned a null response")
-            : "Failed to correct punctuation.";
+            ? (completionResult.Choices.First().Message.Content ?? "Flavor prompt application returned a null response")
+            : "Failed to apply flavor prompt.";
     }
 
     private static async Task ProcessMessageQueue()
@@ -204,8 +204,7 @@ public class Program
         {
             Messages = new List<ChatMessage>()
             {
-                ChatMessage.FromSystem(
-                    "Provide a brief, clear description of each image, focusing on the main subjects and their context. Describe only the most prominent and relevant elements, avoiding detailed or complex descriptions. Summarize each scene in one or two sentences, emphasizing what is essential for understanding the image's primary content and context. Include the total count of the images at the start."),
+                ChatMessage.FromSystem(GetAttachmentPrompt()),
                 ChatMessage.FromUser(attachments.Select(x =>
                         MessageContent.ImageUrlContent(x.Url, GetAttachmentDetail()))
                     .ToList())
@@ -346,8 +345,14 @@ public class Program
             ? descriptiveAttachments
             : throw new InvalidOperationException("Describe attachments flag is missing or invalid");
 
-    private static bool GetFixPunctuation() =>
-        bool.TryParse(_configuration["openai:process_punctuation"], out var fixPunctuation)
-            ? fixPunctuation
-            : throw new InvalidOperationException("Fix punctuation flag is missing or invalid");
+    private static string GetAttachmentPrompt() => GetConfigValue("openai:attachment_prompt", "Attachment Prompt");
+    private static string GetFlavorPrompt() => GetConfigValue("openai:flavor_prompt", "Flavor Prompt");
+    
+    private static string GetConfigValue(string valueKey, string valueName, Func<string, bool>? validation = null)
+    {
+        var value = _configuration[valueKey];
+        if (value == null || (validation != null && !validation(value)))
+            throw new InvalidOperationException($"Config value {valueName} is invalid or missing, see {valueKey}");
+        return value;
+    }
 }
