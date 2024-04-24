@@ -20,7 +20,7 @@ public static partial class Program
     [GeneratedRegex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b", RegexOptions.Multiline, "en-US")]
     private static partial Regex UrlPattern();
 
-    [GeneratedRegex("<:(?<text>.+):[0-9]+>", RegexOptions.Multiline, "en-US")]
+    [GeneratedRegex("<a?:(?<text>.+):[0-9]+>", RegexOptions.Multiline, "en-US")]
     private static partial Regex EmojiPattern();
 
     private static OpenAIService _openAi = null!;
@@ -135,8 +135,8 @@ public static partial class Program
         rawMessage = args.Message.MentionedRoles.Aggregate(rawMessage,
             (current, mention) => current.Replace($"<@&{mention.Id}>", $" at {args.Guild.GetRole(mention.Id).Name}"));
 
-        // Sort out emojis
-        EmojiPattern().Replace(rawMessage, x => x.Groups["text"].Value);
+        // Strip out emojis
+        rawMessage = EmojiPattern().Replace(rawMessage, "");
 
         // Strip out URLs
         rawMessage = UrlPattern().Replace(rawMessage, "").Trim();
