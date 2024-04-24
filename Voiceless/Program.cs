@@ -15,14 +15,13 @@ using OpenAI.ObjectModels.ResponseModels;
 
 namespace Voiceless;
 
-public class Program
+public static partial class Program
 {
-    private static Regex _urlPattern =
-        new Regex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b",
-            RegexOptions.Compiled | RegexOptions.Multiline);
+    [GeneratedRegex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b", RegexOptions.Multiline, "en-US")]
+    private static partial Regex UrlPattern();
 
-    private static Regex _emojiPattern =
-        new Regex(@"<:(?<text>.+):[0-9]+>", RegexOptions.Compiled | RegexOptions.Multiline);
+    [GeneratedRegex("<:(?<text>.+):[0-9]+>", RegexOptions.Multiline, "en-US")]
+    private static partial Regex EmojiPattern();
 
     private static OpenAIService _openAi = null!;
     private static IConfiguration _configuration = null!;
@@ -30,9 +29,9 @@ public class Program
     private static readonly HashSet<string> AllowedVoices = [];
     private static readonly HashSet<string> ImageDetailLevels = [];
 
-    private static readonly ConcurrentQueue<(Stream stream, VoiceNextConnection voiceChannel)> _messageQueue = new();
+    private static readonly ConcurrentQueue<(Stream stream, VoiceNextConnection voiceChannel)> MessageQueue = new();
 
-    public static async Task Main(string[] args)
+    public static async Task Main()
     {
         // Setup allowed models and voices
         foreach (var property in typeof(Models).GetProperties(BindingFlags.Public | BindingFlags.Static))
@@ -66,13 +65,13 @@ public class Program
             .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true, reloadOnChange: true);
         _configuration = builder.Build();
 
-        _openAi = new OpenAIService(new OpenAiOptions()
+        _openAi = new OpenAIService(new OpenAiOptions
         {
             ApiKey = _configuration["openai:token"] ??
                      throw new InvalidOperationException("Invalid configuration, missing OpenAI API token")
         });
 
-        var discord = new DiscordClient(new DiscordConfiguration()
+        var discord = new DiscordClient(new DiscordConfiguration
         {
             Token = _configuration["discord:token"] ??
                     throw new InvalidOperationException("Invalid configuration, missing Discord bot token"),
@@ -98,11 +97,11 @@ public class Program
         // Set nickname
         var targetUser = await server.GetMemberAsync(GetUserId());
         await (await server.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x =>
-            x.Nickname = $"{targetUser.Nickname ?? targetUser.DisplayName ?? "Someone"}'s Microphone");
+            x.Nickname = $"{targetUser.Nickname}'s Microphone");
 
         var channels = await server.GetChannelsAsync();
         var targetChannel = channels.FirstOrDefault(x =>
-            x.Type == ChannelType.Voice && x.Users.Any(y => y.Id == GetUserId() && !y.IsDeafened));
+            x.Type == DiscordChannelType.Voice && x.Users.Any(y => y.Id == GetUserId() && !y.IsDeafened));
         if (targetChannel is not null)
             await targetChannel.ConnectAsync();
     }
@@ -111,37 +110,40 @@ public class Program
     {
         if (args.Channel.Id != GetTextChannelId() || args.Author.Id != GetUserId())
             return;
-        var vcChannel = (VoiceNextConnection?)sender.GetVoiceNext().GetConnection(args.Guild);
+        var vcChannel = sender.GetVoiceNext().GetConnection(args.Guild);
         if (vcChannel == null)
             return;
 
         var rawMessage = args.Message.Content;
+        
+        // Determine if this message should be skipped based on configured skip prefix or current state
+        if (rawMessage.StartsWith(GetOptOutPrefix()))
+            return;
+        
+        // Handle mentioned users
         foreach (var mention in args.Message.MentionedUsers)
         {
             rawMessage = rawMessage.Replace($"<@{mention.Id}>",
                 $" at {(await args.Guild.GetMemberAsync(mention.Id)).DisplayName}");
         }
 
-        foreach (var mention in args.Message.MentionedChannels)
-        {
-            rawMessage = rawMessage.Replace($"<#{mention.Id}>",
-                $" at {args.Guild.GetChannel(mention.Id).Name}");
-        }
+        // Handle mentioned channels
+        rawMessage = args.Message.MentionedChannels.Aggregate(rawMessage,
+            (current, mention) => current.Replace($"<#{mention.Id}>", $" at {args.Guild.GetChannel(mention.Id).Name}"));
 
-        foreach (var mention in args.Message.MentionedRoles)
-        {
-            rawMessage = rawMessage.Replace($"<@&{mention.Id}>",
-                $" at {args.Guild.GetRole(mention.Id).Name}");
-        }
+        // Handle mentioned roles
+        rawMessage = args.Message.MentionedRoles.Aggregate(rawMessage,
+            (current, mention) => current.Replace($"<@&{mention.Id}>", $" at {args.Guild.GetRole(mention.Id).Name}"));
 
         // Sort out emojis
-        _emojiPattern.Replace(rawMessage, x => x.Groups["text"].Value);
+        EmojiPattern().Replace(rawMessage, x => x.Groups["text"].Value);
 
         // Strip out URLs
-        rawMessage = _urlPattern.Replace(rawMessage, "").Trim();
+        rawMessage = UrlPattern().Replace(rawMessage, "").Trim();
 
         // Check for attachments to describe
-        var imageAttachments = args.Message.Attachments.Where(x => x.MediaType.Contains("image")).ToList();
+        var imageAttachments = args.Message.Attachments.Where(x => x.MediaType != null && x.MediaType.Contains("image"))
+            .ToList();
         if (imageAttachments.Count != 0)
             rawMessage += (string.IsNullOrWhiteSpace(rawMessage) ? string.Empty : ". ") +
                           (GetDescriptiveAttachments()
@@ -162,16 +164,16 @@ public class Program
         if (audioResult is not { Successful: true, Data: not null })
             return;
 
-        _messageQueue.Enqueue((audioResult.Data, vcChannel));
-        if (_messageQueue.Count == 1)
+        MessageQueue.Enqueue((audioResult.Data, vcChannel));
+        if (MessageQueue.Count == 1)
             await ProcessMessageQueue();
     }
 
     private static async Task<string> ApplyFlavorPrompt(string rawMessage)
     {
-        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest()
+        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
-            Messages = new List<ChatMessage>()
+            Messages = new List<ChatMessage>
             {
                 ChatMessage.FromSystem(GetFlavorPrompt()),
                 ChatMessage.FromUser(rawMessage)
@@ -180,13 +182,13 @@ public class Program
         });
 
         return completionResult.Successful
-            ? (completionResult.Choices.First().Message.Content ?? "Flavor prompt application returned a null response")
+            ? completionResult.Choices.First().Message.Content ?? "Flavor prompt application returned a null response"
             : "Failed to apply flavor prompt.";
     }
 
     private static async Task ProcessMessageQueue()
     {
-        while (_messageQueue.TryPeek(out var task))
+        while (MessageQueue.TryPeek(out var task))
         {
             // Send it out!
             var transmit = task.voiceChannel.GetTransmitSink();
@@ -194,19 +196,19 @@ public class Program
             task.stream.Close();
 
             // Get rid of the item we were processing afterwards
-            _messageQueue.TryDequeue(out _);
+            MessageQueue.TryDequeue(out _);
         }
     }
 
     private static async Task<string> DescribeAttachments(IEnumerable<DiscordAttachment> attachments)
     {
-        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest()
+        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
-            Messages = new List<ChatMessage>()
+            Messages = new List<ChatMessage>
             {
                 ChatMessage.FromSystem(GetAttachmentPrompt()),
                 ChatMessage.FromUser(attachments.Select(x =>
-                        MessageContent.ImageUrlContent(x.Url, GetAttachmentDetail()))
+                        MessageContent.ImageUrlContent(x.Url!, GetAttachmentDetail()))
                     .ToList())
             },
             MaxTokens = GetMaxAttachmentTokens(),
@@ -215,12 +217,13 @@ public class Program
         });
 
         return completionResult.Successful
-            ? (completionResult.Choices.First().Message.Content ?? "Attachment analysis API returned a null response")
+            ? completionResult.Choices.First().Message.Content ?? "Attachment analysis API returned a null response"
             : "Failed to describe attached images.";
     }
 
+    // ReSharper disable once InconsistentNaming
     private static async Task<AudioCreateSpeechResponse<Stream>> RunTTS(string text) =>
-        await _openAi.Audio.CreateSpeech<Stream>(new AudioCreateSpeechRequest()
+        await _openAi.Audio.CreateSpeech<Stream>(new AudioCreateSpeechRequest
         {
             Model = GetVoiceModel(),
             Input = text,
@@ -240,7 +243,7 @@ public class Program
             var existingConnection = sender.GetVoiceNext().GetConnection(args.Guild);
             if (existingConnection != null)
             {
-                // Dont do anything if we're already in the channel
+                // Don't do anything if we're already in the channel
                 if (existingConnection.TargetChannel.Id == args.After.Channel.Id)
                     return;
 
@@ -347,7 +350,9 @@ public class Program
 
     private static string GetAttachmentPrompt() => GetConfigValue("openai:attachment_prompt", "Attachment Prompt");
     private static string GetFlavorPrompt() => GetConfigValue("openai:flavor_prompt", "Flavor Prompt");
-    
+
+    private static string GetOptOutPrefix() => GetConfigValue("misc:opt_out_prefix", "Opt-Out Prefix");
+
     private static string GetConfigValue(string valueKey, string valueName, Func<string, bool>? validation = null)
     {
         var value = _configuration[valueKey];
