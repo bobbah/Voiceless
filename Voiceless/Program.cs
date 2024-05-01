@@ -5,19 +5,24 @@ using System.Text.RegularExpressions;
 using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
+using DSharpPlus.Exceptions;
 using DSharpPlus.VoiceNext;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using OpenAI;
 using OpenAI.Managers;
 using OpenAI.ObjectModels;
 using OpenAI.ObjectModels.RequestModels;
 using OpenAI.ObjectModels.ResponseModels;
+using Voiceless.Configuration;
+using DiscordConfiguration = Voiceless.Configuration.DiscordConfiguration;
 
 namespace Voiceless;
 
 public static partial class Program
 {
-    [GeneratedRegex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b", RegexOptions.Multiline, "en-US")]
+    [GeneratedRegex(@"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})+(?:/[^\s]*)?\b", RegexOptions.Multiline,
+        "en-US")]
     private static partial Regex UrlPattern();
 
     [GeneratedRegex("<a?:(?<text>.+):[0-9]+>", RegexOptions.Multiline, "en-US")]
@@ -65,15 +70,21 @@ public static partial class Program
             .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true, reloadOnChange: true);
         _configuration = builder.Build();
 
+        // Grab configuration objects
+        var discordConfig = GetConfiguration<DiscordConfiguration>("discord");
+        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
+
+        var miscConfig = GetConfiguration<MiscConfiguration>("misc");
+
         _openAi = new OpenAIService(new OpenAiOptions
         {
-            ApiKey = _configuration["openai:token"] ??
+            ApiKey = openAIConfig.Token ??
                      throw new InvalidOperationException("Invalid configuration, missing OpenAI API token")
         });
 
-        var discord = new DiscordClient(new DiscordConfiguration
+        var discord = new DiscordClient(new DSharpPlus.DiscordConfiguration
         {
-            Token = _configuration["discord:token"] ??
+            Token = discordConfig.Token ??
                     throw new InvalidOperationException("Invalid configuration, missing Discord bot token"),
             TokenType = TokenType.Bot,
             Intents = DiscordIntents.AllUnprivileged | DiscordIntents.MessageContents |
@@ -91,35 +102,65 @@ public static partial class Program
 
     private static async Task SessionCreated(DiscordClient sender, SessionReadyEventArgs args)
     {
-        // Check if target user is in vc already
-        var server = await sender.GetGuildAsync(GetServerId());
+        var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
-        // Set nickname
-        var targetUser = await server.GetMemberAsync(GetUserId());
-        await (await server.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x =>
-            x.Nickname = $"{targetUser.Nickname}'s Microphone");
+        // Update nickname in target servers, note if active server exists
+        DiscordChannel? targetChannel = null;
+        foreach (var server in targetConfig.Servers)
+        {
+            DiscordGuild foundServer;
+            try
+            {
+                foundServer = await sender.GetGuildAsync(server.Server);
+            }
+            catch (NotFoundException)
+            {
+                continue;
+            }
 
-        var channels = await server.GetChannelsAsync();
-        var targetChannel = channels.FirstOrDefault(x =>
-            x.Type == DiscordChannelType.Voice && x.Users.Any(y => y.Id == GetUserId() && !y.IsDeafened));
+            // Get target user in this guild
+            DiscordMember targetUser;
+            try
+            {
+                targetUser = await foundServer.GetMemberAsync(targetConfig.User);
+            }
+            catch (ServerErrorException)
+            {
+                continue;
+            }
+
+            await (await foundServer.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x =>
+                x.Nickname = $"{targetUser.Nickname}'s Microphone");
+
+            // Check if there's an active vc with them in it
+            if (targetChannel is not null)
+                continue;
+            var channels = await foundServer.GetChannelsAsync();
+            targetChannel = channels.FirstOrDefault(x =>
+                x.Type == DiscordChannelType.Voice && x.Users.Any(y => y.Id == targetConfig.User && !y.IsDeafened));
+        }
+
         if (targetChannel is not null)
             await targetChannel.ConnectAsync();
     }
 
     private static async Task MessageCreated(DiscordClient sender, MessageCreateEventArgs args)
     {
-        if (args.Channel.Id != GetTextChannelId() || args.Author.Id != GetUserId())
+        var targetConfig = GetConfiguration<TargetConfiguration>("target");
+
+        if (!targetConfig.Servers.Any(x => x.Channels.Contains(args.Channel.Id)) || args.Author.Id != targetConfig.User)
             return;
         var vcChannel = sender.GetVoiceNext().GetConnection(args.Guild);
         if (vcChannel == null)
             return;
 
         var rawMessage = args.Message.Content;
-        
+
         // Determine if this message should be skipped based on configured skip prefix or current state
-        if (rawMessage.StartsWith(GetOptOutPrefix()))
+        var miscConfig = GetConfiguration<MiscConfiguration>("misc");
+        if (rawMessage.StartsWith(miscConfig.Silencer))
             return;
-        
+
         // Handle mentioned users
         foreach (var mention in args.Message.MentionedUsers)
         {
@@ -141,12 +182,14 @@ public static partial class Program
         // Strip out URLs
         rawMessage = UrlPattern().Replace(rawMessage, "").Trim();
 
+        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
+
         // Check for attachments to describe
         var imageAttachments = args.Message.Attachments.Where(x => x.MediaType != null && x.MediaType.Contains("image"))
             .ToList();
         if (imageAttachments.Count != 0)
             rawMessage += (string.IsNullOrWhiteSpace(rawMessage) ? string.Empty : ". ") +
-                          (GetDescriptiveAttachments()
+                          (openAIConfig.DescribeAttachments
                               ? await DescribeAttachments(imageAttachments)
                               : $"I've attached {imageAttachments.Count} images to my post.");
 
@@ -155,7 +198,7 @@ public static partial class Program
             return;
 
         // Apply flavor prompt if it is provided
-        var flavorPrompt = GetFlavorPrompt();
+        var flavorPrompt = openAIConfig.FlavorPrompt;
         if (flavorPrompt != string.Empty)
             rawMessage = await ApplyFlavorPrompt(rawMessage);
 
@@ -171,11 +214,13 @@ public static partial class Program
 
     private static async Task<string> ApplyFlavorPrompt(string rawMessage)
     {
+        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
+
         var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
             Messages = new List<ChatMessage>
             {
-                ChatMessage.FromSystem(GetFlavorPrompt()),
+                ChatMessage.FromSystem(openAIConfig.FlavorPrompt),
                 ChatMessage.FromUser(rawMessage)
             },
             Model = Models.Gpt_4_1106_preview
@@ -202,16 +247,18 @@ public static partial class Program
 
     private static async Task<string> DescribeAttachments(IEnumerable<DiscordAttachment> attachments)
     {
+        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
+
         var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
         {
             Messages = new List<ChatMessage>
             {
-                ChatMessage.FromSystem(GetAttachmentPrompt()),
+                ChatMessage.FromSystem(openAIConfig.AttachmentPrompt),
                 ChatMessage.FromUser(attachments.Select(x =>
-                        MessageContent.ImageUrlContent(x.Url!, GetAttachmentDetail()))
+                        MessageContent.ImageUrlContent(x.Url!, openAIConfig.AttachmentDetail))
                     .ToList())
             },
-            MaxTokens = GetMaxAttachmentTokens(),
+            MaxTokens = openAIConfig.MaxAttachmentTokens,
             Model = Models.Gpt_4_vision_preview,
             N = 1
         });
@@ -222,19 +269,25 @@ public static partial class Program
     }
 
     // ReSharper disable once InconsistentNaming
-    private static async Task<AudioCreateSpeechResponse<Stream>> RunTTS(string text) =>
-        await _openAi.Audio.CreateSpeech<Stream>(new AudioCreateSpeechRequest
+    private static async Task<AudioCreateSpeechResponse<Stream>> RunTTS(string text)
+    {
+        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
+
+        return await _openAi.Audio.CreateSpeech<Stream>(new AudioCreateSpeechRequest
         {
-            Model = GetVoiceModel(),
+            Model = openAIConfig.Model,
             Input = text,
-            Voice = GetVoice(),
+            Voice = openAIConfig.Voice,
             ResponseFormat = StaticValues.AudioStatics.CreateSpeechResponseFormat.Opus,
             Speed = 1f
         });
+    }
+
 
     private static async Task VoiceStateUpdated(DiscordClient sender, VoiceStateUpdateEventArgs args)
     {
-        if (args.User.Id != GetUserId())
+        var targetConfig = GetConfiguration<TargetConfiguration>("target");
+        if (args.User.Id != targetConfig.User)
             return;
 
         // Gotta get in there....
@@ -296,68 +349,11 @@ public static partial class Program
         await ffmpeg.WaitForExitAsync();
     }
 
-    private static ulong GetUserId()
-        => ulong.TryParse(_configuration["target:user"], out var userId)
-            ? userId
-            : throw new InvalidOperationException("Target user ID is missing or invalid");
-
-    private static ulong GetServerId()
-        => ulong.TryParse(_configuration["target:server"], out var userId)
-            ? userId
-            : throw new InvalidOperationException("Target server ID is missing or invalid");
-
-    private static ulong GetTextChannelId()
-        => ulong.TryParse(_configuration["target:text_channel"], out var userId)
-            ? userId
-            : throw new InvalidOperationException("Target text channel ID is missing or invalid");
-
-    private static string GetVoiceModel()
+    private static T GetConfiguration<T>(string section) where T : class, new()
     {
-        var configured = _configuration["openai:model"];
-        if (configured == null || !AllowedModels.Contains(configured))
-            throw new InvalidOperationException(
-                $"Configured model is invalid or missing. Valid models: {string.Join(", ", AllowedModels)}");
-        return configured;
-    }
-
-    private static string GetVoice()
-    {
-        var configured = _configuration["openai:voice"];
-        if (configured == null || !AllowedVoices.Contains(configured))
-            throw new InvalidOperationException(
-                $"Configured voice is invalid or missing. Valid voices: {string.Join(", ", AllowedVoices)}");
-        return configured;
-    }
-
-    private static string GetAttachmentDetail()
-    {
-        var configured = _configuration["openai:attachment_detail"];
-        if (configured == null || !ImageDetailLevels.Contains(configured))
-            throw new InvalidOperationException(
-                $"Attachment detail level is invalid or missing. Valid levels: {string.Join(", ", ImageDetailLevels)}");
-        return configured;
-    }
-
-    private static int GetMaxAttachmentTokens() =>
-        int.TryParse(_configuration["openai:max_attachment_tokens"], out var attachmentTokens)
-            ? attachmentTokens
-            : throw new InvalidOperationException("Max attachment tokens is missing or invalid");
-
-    private static bool GetDescriptiveAttachments() =>
-        bool.TryParse(_configuration["openai:describe_attachments"], out var descriptiveAttachments)
-            ? descriptiveAttachments
-            : throw new InvalidOperationException("Describe attachments flag is missing or invalid");
-
-    private static string GetAttachmentPrompt() => GetConfigValue("openai:attachment_prompt", "Attachment Prompt");
-    private static string GetFlavorPrompt() => GetConfigValue("openai:flavor_prompt", "Flavor Prompt");
-
-    private static string GetOptOutPrefix() => GetConfigValue("misc:opt_out_prefix", "Opt-Out Prefix");
-
-    private static string GetConfigValue(string valueKey, string valueName, Func<string, bool>? validation = null)
-    {
-        var value = _configuration[valueKey];
-        if (value == null || (validation != null && !validation(value)))
-            throw new InvalidOperationException($"Config value {valueName} is invalid or missing, see {valueKey}");
-        return value;
+        var toReturn = new T();
+        var options = new ConfigureOptions<T>(o => _configuration.GetSection(section).Bind(o));
+        options.Configure(toReturn);
+        return toReturn;
     }
 }
