@@ -169,9 +169,11 @@ public static partial class Program
         }
 
         // Handle mentioned channels
-        rawMessage = args.Message.MentionedChannels.Aggregate(rawMessage,
-            (current, mention) => current.Replace($"<#{mention.Id}>", $" at {args.Guild.GetChannel(mention.Id).Name}"));
-
+        foreach (var mention in args.Message.MentionedChannels)
+        {
+            rawMessage = rawMessage.Replace($"<#{mention.Id}>", $" at {(await args.Guild.GetChannelAsync(mention.Id)).Name}");
+        }
+        
         // Handle mentioned roles
         rawMessage = args.Message.MentionedRoles.Aggregate(rawMessage,
             (current, mention) => current.Replace($"<@&{mention.Id}>", $" at {args.Guild.GetRole(mention.Id).Name}"));
@@ -223,7 +225,7 @@ public static partial class Program
                 ChatMessage.FromSystem(openAIConfig.FlavorPrompt),
                 ChatMessage.FromUser(rawMessage)
             },
-            Model = Models.Gpt_4_1106_preview
+            Model = Models.Gpt_4o
         });
 
         return completionResult.Successful
@@ -259,7 +261,7 @@ public static partial class Program
                     .ToList())
             },
             MaxTokens = openAIConfig.MaxAttachmentTokens,
-            Model = Models.Gpt_4_vision_preview,
+            Model = Models.Gpt_4o,
             N = 1
         });
 
