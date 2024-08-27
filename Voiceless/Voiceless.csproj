@@ -9,8 +9,8 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <PackageReference Include="Betalgo.OpenAI" Version="8.2.2" />
-      <PackageReference Include="DSharpPlus.VoiceNext" Version="5.0.0-nightly-02267" />
+      <PackageReference Include="Betalgo.OpenAI" Version="8.6.2" />
+      <PackageReference Include="DSharpPlus.VoiceNext" Version="5.0.0-nightly-02358" />
       <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
       <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
       <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="8.0.0" />

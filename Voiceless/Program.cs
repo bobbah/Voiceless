@@ -8,6 +8,7 @@ using DSharpPlus.EventArgs;
 using DSharpPlus.Exceptions;
 using DSharpPlus.VoiceNext;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OpenAI;
 using OpenAI.Managers;
@@ -82,25 +83,27 @@ public static partial class Program
                      throw new InvalidOperationException("Invalid configuration, missing OpenAI API token")
         });
 
-        var discord = new DiscordClient(new DSharpPlus.DiscordConfiguration
+        var clientBuilder = DiscordClientBuilder.CreateDefault(discordConfig.Token ??
+                                                               throw new InvalidOperationException(
+                                                                   "Invalid configuration, missing Discord bot token"),
+            DiscordIntents.AllUnprivileged | DiscordIntents.MessageContents |
+            DiscordIntents.GuildVoiceStates | DiscordIntents.GuildMembers);
+
+        clientBuilder.UseVoiceNext(new VoiceNextConfiguration());
+
+        clientBuilder.ConfigureEventHandlers(e =>
         {
-            Token = discordConfig.Token ??
-                    throw new InvalidOperationException("Invalid configuration, missing Discord bot token"),
-            TokenType = TokenType.Bot,
-            Intents = DiscordIntents.AllUnprivileged | DiscordIntents.MessageContents |
-                      DiscordIntents.GuildVoiceStates | DiscordIntents.GuildMembers
+            e.HandleVoiceStateUpdated(VoiceStateUpdated);
+            e.HandleMessageCreated(MessageCreated);
+            e.HandleSessionCreated(SessionCreated);
         });
-        discord.UseVoiceNext();
-
-        discord.VoiceStateUpdated += VoiceStateUpdated;
-        discord.MessageCreated += MessageCreated;
-        discord.SessionCreated += SessionCreated;
-
+        
+        var discord = clientBuilder.Build();
         await discord.ConnectAsync();
         await Task.Delay(Timeout.Infinite);
     }
 
-    private static async Task SessionCreated(DiscordClient sender, SessionReadyEventArgs args)
+    private static async Task SessionCreated(DiscordClient sender, SessionCreatedEventArgs args)
     {
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
@@ -144,13 +147,13 @@ public static partial class Program
             await targetChannel.ConnectAsync();
     }
 
-    private static async Task MessageCreated(DiscordClient sender, MessageCreateEventArgs args)
+    private static async Task MessageCreated(DiscordClient sender, MessageCreatedEventArgs args)
     {
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
         if (!targetConfig.Servers.Any(x => x.Channels.Contains(args.Channel.Id)) || args.Author.Id != targetConfig.User)
             return;
-        var vcChannel = sender.GetVoiceNext().GetConnection(args.Guild);
+        var vcChannel = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild);
         if (vcChannel == null)
             return;
 
@@ -171,12 +174,16 @@ public static partial class Program
         // Handle mentioned channels
         foreach (var mention in args.Message.MentionedChannels)
         {
-            rawMessage = rawMessage.Replace($"<#{mention.Id}>", $" at {(await args.Guild.GetChannelAsync(mention.Id)).Name}");
+            rawMessage = rawMessage.Replace($"<#{mention.Id}>",
+                $" at {(await args.Guild.GetChannelAsync(mention.Id)).Name}");
         }
-        
+
         // Handle mentioned roles
-        rawMessage = args.Message.MentionedRoles.Aggregate(rawMessage,
-            (current, mention) => current.Replace($"<@&{mention.Id}>", $" at {args.Guild.GetRole(mention.Id).Name}"));
+        foreach (var mention in args.Message.MentionedRoles)
+        {
+            rawMessage = rawMessage.Replace($"<@&{mention.Id}>",
+                $" at {(await args.Guild.GetRoleAsync(mention.Id)).Name}");
+        }
 
         // Strip out emojis
         rawMessage = EmojiPattern().Replace(rawMessage, "");
@@ -286,7 +293,7 @@ public static partial class Program
     }
 
 
-    private static async Task VoiceStateUpdated(DiscordClient sender, VoiceStateUpdateEventArgs args)
+    private static async Task VoiceStateUpdated(DiscordClient sender, VoiceStateUpdatedEventArgs args)
     {
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
         if (args.User.Id != targetConfig.User)
@@ -295,7 +302,7 @@ public static partial class Program
         // Gotta get in there....
         if (args.After is { Channel: not null, IsSelfDeafened: false, IsServerDeafened: false })
         {
-            var existingConnection = sender.GetVoiceNext().GetConnection(args.Guild);
+            var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild);
             if (existingConnection != null)
             {
                 // Don't do anything if we're already in the channel
@@ -312,7 +319,7 @@ public static partial class Program
         else
         {
             // Exit out of the channel if the target is now muted
-            sender.GetVoiceNext().GetConnection(args.Guild)?.Disconnect();
+            sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild)?.Disconnect();
         }
     }
 
