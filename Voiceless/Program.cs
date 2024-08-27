@@ -133,7 +133,7 @@ public static partial class Program
             }
 
             await (await foundServer.GetMemberAsync(sender.CurrentUser.Id)).ModifyAsync(x =>
-                x.Nickname = $"{targetUser.Nickname}'s Microphone");
+                x.Nickname = $"{targetUser.Nickname[..Math.Min(26, targetUser.Nickname.Length)]}'s Mic");
 
             // Check if there's an active vc with them in it
             if (targetChannel is not null)
