@@ -8,9 +8,9 @@ public class OpenAIVoiceSynthesizer(OpenAIClient openAI, OpenAIConfiguration con
 {
     public string AudioFormat => "ogg";
 
-    public async Task<Stream?> SynthesizeTextToSpeechAsync(string text)
+    public async Task<Stream?> SynthesizeTextToSpeechAsync(string text, string voice)
     {
-        var result = await openAI.GetAudioClient(config.Model).GenerateSpeechAsync(text, config.Voice, new SpeechGenerationOptions()
+        var result = await openAI.GetAudioClient(config.Model).GenerateSpeechAsync(text, voice, new SpeechGenerationOptions()
         {
             ResponseFormat = GeneratedSpeechFormat.Opus,
             SpeedRatio = 1f

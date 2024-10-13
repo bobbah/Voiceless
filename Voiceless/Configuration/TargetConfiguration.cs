@@ -1,7 +1,6 @@
 namespace Voiceless.Configuration;
 
-public class TargetConfiguration
+public record TargetConfiguration
 {
-    public ulong User { get; set; }
-    public List<TargetServer> Servers { get; set; }
+    public List<TargetUser> Users { get; init; }
 }

@@ -19,7 +19,7 @@ public class ElevenLabsVoiceSynthesizer(ElevenLabsConfiguration config) : IVoice
 
     public string AudioFormat => "mp3";
 
-    public async Task<Stream?> SynthesizeTextToSpeechAsync(string text)
+    public async Task<Stream?> SynthesizeTextToSpeechAsync(string text, string voice)
     {
         var result = await _client.TextToSpeechEndpoint.TextToSpeechAsync(text, _voice, model: _model, voiceSettings: new VoiceSettings(config.Stability, config.Similarity));
         if (result == null)

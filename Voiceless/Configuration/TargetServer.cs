@@ -1,7 +1,7 @@
 namespace Voiceless.Configuration;
 
-public class TargetServer
+public record TargetServer
 {
-    public ulong Server { get; set; }
-    public List<ulong> Channels { get; set; }
+    public ulong Server { get; init; }
+    public List<ulong> Channels { get; init; }
 }
