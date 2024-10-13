@@ -312,7 +312,12 @@ public static partial class Program
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
         var channels = (await guild.GetChannelsAsync())
             .Where(x => x.Type == DiscordChannelType.Voice && x.Users.Any(y => users.Contains(y.Id)))
-            .Select(x => new { value = x, score = x.Users.Count(y => users.Contains(y.Id) && !y.IsDeafened) })
+            .Select(x => new
+            {
+                value = x,
+                score = x.Users.Count(y =>
+                    users.Contains(y.Id) && y.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false })
+            })
             .OrderByDescending(x => x.score)
             .ToList();
 
@@ -343,7 +348,7 @@ public static partial class Program
             return;
 
         // Don't bother processing anything other than a nickname/name change
-        if (args.NicknameAfter.Equals(args.NicknameAfter))
+        if (args.NicknameAfter.Equals(args.NicknameBefore))
             return;
 
         // Get target user in this guild
