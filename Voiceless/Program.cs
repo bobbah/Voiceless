@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿using System.ClientModel;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.RegularExpressions;
@@ -11,9 +12,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OpenAI;
-using OpenAI.Managers;
-using OpenAI.ObjectModels;
-using OpenAI.ObjectModels.RequestModels;
+using OpenAI.Chat;
 using Voiceless.Configuration;
 using Voiceless.Data;
 using Voiceless.Voice;
@@ -30,7 +29,7 @@ public static partial class Program
     [GeneratedRegex("<a?:(?<text>.+):[0-9]+>", RegexOptions.Multiline, "en-US")]
     private static partial Regex EmojiPattern();
 
-    private static OpenAIService _openAi = null!;
+    private static OpenAIClient _openAi = null!;
     private static IVoiceSynthesizer _voiceSynth = null!;
     private static IConfiguration _configuration = null!;
 
@@ -48,16 +47,15 @@ public static partial class Program
         // Grab configuration objects
         var discordConfig = _configuration.GetSection("discord").Get<DiscordConfiguration>();
         var openAIConfig = _configuration.GetSection("openai").Get<OpenAIConfiguration>();
-        
-        _openAi = new OpenAIService(new OpenAiOptions
-        {
-            ApiKey = openAIConfig?.Token ??
-                     throw new InvalidOperationException("Invalid configuration, missing OpenAI API token")
-        });
-        
+
+        _openAi = new OpenAIClient(new ApiKeyCredential(openAIConfig?.Token ??
+                                                        throw new InvalidOperationException(
+                                                            "Invalid configuration, missing OpenAI API token")),
+            new OpenAIClientOptions());
+
         // Use ElevenLabs when available
         var elevenLabsConfig = _configuration.GetSection("elevenlabs").Get<ElevenLabsConfiguration>();
-        if (elevenLabsConfig?.Token != null)
+        if (!string.IsNullOrEmpty(elevenLabsConfig?.Token))
         {
             var synth = new ElevenLabsVoiceSynthesizer(elevenLabsConfig);
             await synth.ConfigureClient();
@@ -80,7 +78,7 @@ public static partial class Program
             e.HandleMessageCreated(MessageCreated);
             e.HandleSessionCreated(SessionCreated);
         });
-        
+
         var discord = clientBuilder.Build();
         await discord.ConnectAsync();
         await Task.Delay(Timeout.Infinite);
@@ -208,18 +206,14 @@ public static partial class Program
     {
         var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
 
-        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
+        var completionResult = await _openAi.GetChatClient("gpt-4o-mini").CompleteChatAsync(new List<ChatMessage>
         {
-            Messages = new List<ChatMessage>
-            {
-                ChatMessage.FromSystem(openAIConfig.FlavorPrompt),
-                ChatMessage.FromUser(rawMessage)
-            },
-            Model = Models.Gpt_4o
+            ChatMessage.CreateSystemMessage(openAIConfig.FlavorPrompt),
+            ChatMessage.CreateUserMessage(rawMessage)
         });
 
-        return completionResult.Successful
-            ? completionResult.Choices.First().Message.Content ?? "Flavor prompt application returned a null response"
+        return completionResult != null
+            ? completionResult.Value.Content.First().Text ?? "Flavor prompt application returned a null response"
             : "Failed to apply flavor prompt.";
     }
 
@@ -241,22 +235,19 @@ public static partial class Program
     {
         var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
 
-        var completionResult = await _openAi.ChatCompletion.CreateCompletion(new ChatCompletionCreateRequest
+        var completionResult = await _openAi.GetChatClient("gpt-4o-mini").CompleteChatAsync(new List<ChatMessage>
         {
-            Messages = new List<ChatMessage>
-            {
-                ChatMessage.FromSystem(openAIConfig.AttachmentPrompt),
-                ChatMessage.FromUser(attachments.Select(x =>
-                        MessageContent.ImageUrlContent(x.Url!, openAIConfig.AttachmentDetail))
-                    .ToList())
-            },
-            MaxTokens = openAIConfig.MaxAttachmentTokens,
-            Model = Models.Gpt_4o,
-            N = 1
+            ChatMessage.CreateSystemMessage(openAIConfig.AttachmentPrompt),
+            ChatMessage.CreateUserMessage(attachments.Select(x =>
+                    ChatMessageContentPart.CreateImagePart(new Uri(x.Url!), openAIConfig.AttachmentDetail))
+                .ToList())
+        }, new ChatCompletionOptions()
+        {
+            MaxOutputTokenCount = openAIConfig.MaxAttachmentTokens
         });
 
-        return completionResult.Successful
-            ? completionResult.Choices.First().Message.Content ?? "Attachment analysis API returned a null response"
+        return completionResult != null
+            ? completionResult.Value.Content.First().Text ?? "Attachment analysis API returned a null response"
             : "Failed to describe attached images.";
     }
 
@@ -269,7 +260,8 @@ public static partial class Program
         // Gotta get in there....
         if (args.After is { Channel: not null, IsSelfDeafened: false, IsServerDeafened: false })
         {
-            var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild);
+            var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>()
+                .GetConnection(args.Guild);
             if (existingConnection != null)
             {
                 // Don't do anything if we're already in the channel

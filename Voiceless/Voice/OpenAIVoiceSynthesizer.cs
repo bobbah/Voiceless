@@ -1,25 +1,21 @@
-using OpenAI.Managers;
-using OpenAI.ObjectModels;
-using OpenAI.ObjectModels.RequestModels;
+using OpenAI;
+using OpenAI.Audio;
 using Voiceless.Configuration;
 
 namespace Voiceless.Voice;
 
-public class OpenAIVoiceSynthesizer(OpenAIService openAI, OpenAIConfiguration config) : IVoiceSynthesizer
+public class OpenAIVoiceSynthesizer(OpenAIClient openAI, OpenAIConfiguration config) : IVoiceSynthesizer
 {
     public string AudioFormat => "ogg";
 
     public async Task<Stream?> SynthesizeTextToSpeechAsync(string text)
     {
-        var result = await openAI.Audio.CreateSpeech<Stream>(new AudioCreateSpeechRequest
+        var result = await openAI.GetAudioClient(config.Model).GenerateSpeechAsync(text, config.Voice, new SpeechGenerationOptions()
         {
-            Model = config.Model,
-            Input = text,
-            Voice = config.Voice,
-            ResponseFormat = StaticValues.AudioStatics.CreateSpeechResponseFormat.Opus,
-            Speed = 1f
+            ResponseFormat = GeneratedSpeechFormat.Opus,
+            SpeedRatio = 1f
         });
 
-        return result.Successful ? result.Data : null;
+        return result?.Value.ToStream();
     }
 }
