@@ -14,8 +14,9 @@ using OpenAI;
 using OpenAI.Managers;
 using OpenAI.ObjectModels;
 using OpenAI.ObjectModels.RequestModels;
-using OpenAI.ObjectModels.ResponseModels;
 using Voiceless.Configuration;
+using Voiceless.Data;
+using Voiceless.Voice;
 using DiscordConfiguration = Voiceless.Configuration.DiscordConfiguration;
 
 namespace Voiceless;
@@ -30,40 +31,13 @@ public static partial class Program
     private static partial Regex EmojiPattern();
 
     private static OpenAIService _openAi = null!;
+    private static IVoiceSynthesizer _voiceSynth = null!;
     private static IConfiguration _configuration = null!;
-    private static readonly HashSet<string> AllowedModels = [];
-    private static readonly HashSet<string> AllowedVoices = [];
-    private static readonly HashSet<string> ImageDetailLevels = [];
 
-    private static readonly ConcurrentQueue<(Stream stream, VoiceNextConnection voiceChannel)> MessageQueue = new();
+    private static readonly ConcurrentQueue<QueuedMessage> MessageQueue = new();
 
     public static async Task Main()
     {
-        // Setup allowed models and voices
-        foreach (var property in typeof(Models).GetProperties(BindingFlags.Public | BindingFlags.Static))
-        {
-            var propertyValue = (string?)property.GetValue(null);
-            if (property.PropertyType == typeof(string) && !string.IsNullOrWhiteSpace(propertyValue) &&
-                propertyValue.StartsWith("tts", StringComparison.InvariantCultureIgnoreCase))
-                AllowedModels.Add(propertyValue);
-        }
-
-        foreach (var property in typeof(StaticValues.AudioStatics.Voice).GetProperties(BindingFlags.Public |
-                     BindingFlags.Static))
-        {
-            var propertyValue = (string?)property.GetValue(null);
-            if (property.PropertyType == typeof(string) && !string.IsNullOrWhiteSpace(propertyValue))
-                AllowedVoices.Add(propertyValue);
-        }
-
-        foreach (var property in typeof(StaticValues.ImageStatics.ImageDetailTypes).GetProperties(BindingFlags.Public |
-                     BindingFlags.Static))
-        {
-            var propertyValue = (string?)property.GetValue(null);
-            if (property.PropertyType == typeof(string) && !string.IsNullOrWhiteSpace(propertyValue))
-                ImageDetailLevels.Add(propertyValue);
-        }
-
         // Get config
         var builder = new ConfigurationBuilder()
             .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
@@ -72,18 +46,27 @@ public static partial class Program
         _configuration = builder.Build();
 
         // Grab configuration objects
-        var discordConfig = GetConfiguration<DiscordConfiguration>("discord");
-        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
-
-        var miscConfig = GetConfiguration<MiscConfiguration>("misc");
-
+        var discordConfig = _configuration.GetSection("discord").Get<DiscordConfiguration>();
+        var openAIConfig = _configuration.GetSection("openai").Get<OpenAIConfiguration>();
+        
         _openAi = new OpenAIService(new OpenAiOptions
         {
-            ApiKey = openAIConfig.Token ??
+            ApiKey = openAIConfig?.Token ??
                      throw new InvalidOperationException("Invalid configuration, missing OpenAI API token")
         });
+        
+        // Use ElevenLabs when available
+        var elevenLabsConfig = _configuration.GetSection("elevenlabs").Get<ElevenLabsConfiguration>();
+        if (elevenLabsConfig?.Token != null)
+        {
+            var synth = new ElevenLabsVoiceSynthesizer(elevenLabsConfig);
+            await synth.ConfigureClient();
+            _voiceSynth = synth;
+        }
+        else
+            _voiceSynth = new OpenAIVoiceSynthesizer(_openAi, openAIConfig);
 
-        var clientBuilder = DiscordClientBuilder.CreateDefault(discordConfig.Token ??
+        var clientBuilder = DiscordClientBuilder.CreateDefault(discordConfig?.Token ??
                                                                throw new InvalidOperationException(
                                                                    "Invalid configuration, missing Discord bot token"),
             DiscordIntents.AllUnprivileged | DiscordIntents.MessageContents |
@@ -212,11 +195,11 @@ public static partial class Program
             rawMessage = await ApplyFlavorPrompt(rawMessage);
 
         // Perform TTS conversion
-        var audioResult = await RunTTS(rawMessage);
-        if (audioResult is not { Successful: true, Data: not null })
+        var audioResult = await _voiceSynth.SynthesizeTextToSpeechAsync(rawMessage);
+        if (audioResult == null)
             return;
 
-        MessageQueue.Enqueue((audioResult.Data, vcChannel));
+        MessageQueue.Enqueue(new QueuedMessage(audioResult, vcChannel, _voiceSynth.AudioFormat));
         if (MessageQueue.Count == 1)
             await ProcessMessageQueue();
     }
@@ -245,9 +228,9 @@ public static partial class Program
         while (MessageQueue.TryPeek(out var task))
         {
             // Send it out!
-            var transmit = task.voiceChannel.GetTransmitSink();
-            await ConvertAudioToPcm(task.stream, transmit);
-            task.stream.Close();
+            var transmit = task.VoiceChannel.GetTransmitSink();
+            await ConvertAudioToPcm(task.Stream, transmit, task.AudioFormat);
+            task.Stream.Close();
 
             // Get rid of the item we were processing afterwards
             MessageQueue.TryDequeue(out _);
@@ -276,22 +259,6 @@ public static partial class Program
             ? completionResult.Choices.First().Message.Content ?? "Attachment analysis API returned a null response"
             : "Failed to describe attached images.";
     }
-
-    // ReSharper disable once InconsistentNaming
-    private static async Task<AudioCreateSpeechResponse<Stream>> RunTTS(string text)
-    {
-        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
-
-        return await _openAi.Audio.CreateSpeech<Stream>(new AudioCreateSpeechRequest
-        {
-            Model = openAIConfig.Model,
-            Input = text,
-            Voice = openAIConfig.Voice,
-            ResponseFormat = StaticValues.AudioStatics.CreateSpeechResponseFormat.Opus,
-            Speed = 1f
-        });
-    }
-
 
     private static async Task VoiceStateUpdated(DiscordClient sender, VoiceStateUpdatedEventArgs args)
     {
@@ -323,12 +290,12 @@ public static partial class Program
         }
     }
 
-    private static async Task ConvertAudioToPcm(Stream inputStream, VoiceTransmitSink outputStream)
+    private static async Task ConvertAudioToPcm(Stream inputStream, VoiceTransmitSink outputStream, string audioFormat)
     {
         var ffmpeg = Process.Start(new ProcessStartInfo
         {
             FileName = "ffmpeg",
-            Arguments = "-f ogg -i pipe:0 -ac 2 -f s16le -ar 48000 pipe:1",
+            Arguments = $"-f {audioFormat} -i pipe:0 -ac 2 -f s16le -ar 48000 pipe:1",
             RedirectStandardOutput = true,
             RedirectStandardInput = true,
             UseShellExecute = false
