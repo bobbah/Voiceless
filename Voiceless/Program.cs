@@ -33,7 +33,7 @@ public static partial class Program
     private static IVoiceSynthesizer _voiceSynth = null!;
     private static IConfiguration _configuration = null!;
 
-    private static readonly ConcurrentQueue<QueuedMessage> MessageQueue = new();
+    private static readonly ConcurrentDictionary<ulong, ConcurrentQueue<QueuedMessage>> MessageQueues = new();
     private static HashSet<ulong> _personsOfInterest = [];
     private static HashSet<ulong> _channelsOfInterest = [];
     private static HashSet<ulong> _serversOfInterest = [];
@@ -49,8 +49,8 @@ public static partial class Program
         _configuration = builder.Build();
 
         // Grab configuration objects
-        var discordConfig = _configuration.GetSection("discord").Get<DiscordConfiguration>();
-        var openAIConfig = _configuration.GetSection("openai").Get<OpenAIConfiguration>();
+        var discordConfig = GetConfiguration<DiscordConfiguration>("discord");
+        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
 
         _openAi = new OpenAIClient(new ApiKeyCredential(openAIConfig?.Token ??
                                                         throw new InvalidOperationException(
@@ -64,9 +64,13 @@ public static partial class Program
         _serversOfInterest = [..targetConfig.Users.SelectMany(x => x.Servers).Select(x => x.Server).Distinct()];
         _voices = new ConcurrentDictionary<ulong, string>(targetConfig.Users.Select(x =>
             new KeyValuePair<ulong, string>(x.User, x.Voice)));
+        foreach (var server in _serversOfInterest)
+        {
+            MessageQueues[server] = new ConcurrentQueue<QueuedMessage>();
+        }
 
         // Use ElevenLabs when available
-        var elevenLabsConfig = _configuration.GetSection("elevenlabs").Get<ElevenLabsConfiguration>();
+        var elevenLabsConfig = GetConfiguration<ElevenLabsConfiguration>("elevenlabs");
         if (!string.IsNullOrEmpty(elevenLabsConfig?.Token))
         {
             var synth = new ElevenLabsVoiceSynthesizer(elevenLabsConfig);
@@ -125,40 +129,14 @@ public static partial class Program
             {
                 continue;
             }
-
-            // Get target user in this guild
-            List<DiscordMember> targetUsers = [];
-            foreach (var user in server.Value)
-            {
-                try
-                {
-                    targetUsers.Add(await foundServer.GetMemberAsync(user));
-                }
-                catch (ServerErrorException)
-                {
-                }
-            }
-
-            var voiceless = await foundServer.GetMemberAsync(sender.CurrentUser.Id);
-            switch (targetUsers.Count)
-            {
-                case 0:
-                    await voiceless.ModifyAsync(x => x.Nickname = "Voiceless");
-                    continue;
-                case 1:
-                    await voiceless.ModifyAsync(x =>
-                        x.Nickname =
-                            $"{targetUsers[0].Nickname[..Math.Min(26, targetUsers[0].Nickname.Length)]}'s Mic");
-                    break;
-                default:
-                    await voiceless.ModifyAsync(x => x.Nickname = "Multi-User Mic");
-                    break;
-            }
-
-            // Check if there's an active vc and join it
+            
+            // Get target channel, if any, if none is found don't go further
+            await SetNickname(sender, foundServer);
             var targetChannel = await GetTargetChannel(sender, foundServer);
             if (targetChannel is null)
                 continue;
+            
+            // Connect to target channel
             await targetChannel.ConnectAsync();
         }
     }
@@ -169,6 +147,11 @@ public static partial class Program
             return;
         var vcChannel = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild);
         if (vcChannel == null)
+            return;
+
+        // If the user is not in the vc channel, or not undeafened, ignore them
+        if (!vcChannel.TargetChannel.Users.Any(x =>
+                x.Id == args.Author.Id && x.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false }))
             return;
 
         var rawMessage = args.Message.Content;
@@ -230,9 +213,10 @@ public static partial class Program
         if (audioResult == null)
             return;
 
-        MessageQueue.Enqueue(new QueuedMessage(audioResult, vcChannel, _voiceSynth.AudioFormat));
-        if (MessageQueue.Count == 1)
-            await ProcessMessageQueue();
+        var guildId = vcChannel.TargetChannel.Guild.Id;
+        MessageQueues[guildId].Enqueue(new QueuedMessage(audioResult, vcChannel, _voiceSynth.AudioFormat));
+        if (MessageQueues[guildId].Count == 1)
+            await ProcessMessageQueue(guildId);
     }
 
     private static async Task<string> ApplyFlavorPrompt(string rawMessage)
@@ -250,9 +234,9 @@ public static partial class Program
             : "Failed to apply flavor prompt.";
     }
 
-    private static async Task ProcessMessageQueue()
+    private static async Task ProcessMessageQueue(ulong guildId)
     {
-        while (MessageQueue.TryPeek(out var task))
+        while (MessageQueues[guildId].TryPeek(out var task))
         {
             // Send it out!
             var transmit = task.VoiceChannel.GetTransmitSink();
@@ -260,7 +244,7 @@ public static partial class Program
             task.Stream.Close();
 
             // Get rid of the item we were processing afterwards
-            MessageQueue.TryDequeue(out _);
+            MessageQueues[guildId].TryDequeue(out _);
         }
     }
 
@@ -289,6 +273,9 @@ public static partial class Program
         if (!_personsOfInterest.Contains(args.User.Id) || !_serversOfInterest.Contains(args.Guild.Id))
             return;
 
+        // Set nickname if an update is needed
+        await SetNickname(sender, args.Guild);
+        
         var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>()
             .GetConnection(args.Guild);
         var target = await GetTargetChannel(sender, args.Guild);
@@ -352,28 +339,34 @@ public static partial class Program
             return;
 
         // Get target user in this guild
-        List<DiscordMember> targetUsers = [];
-        var users = UsersOfInterestForServer(args.Guild.Id);
-        foreach (var user in users)
+        await SetNickname(sender, args.Guild);
+    }
+
+    private static async Task SetNickname(DiscordClient client, DiscordGuild guild)
+    {
+        // Get target channel, if any, if none is found don't go further
+        var voiceless = await guild.GetMemberAsync(client.CurrentUser.Id);
+        var targetChannel = await GetTargetChannel(client, guild);
+        if (targetChannel is null)
         {
-            try
-            {
-                targetUsers.Add(await args.Guild.GetMemberAsync(user));
-            }
-            catch (ServerErrorException)
-            {
-            }
+            await voiceless.ModifyAsync(x => x.Nickname = "Voiceless");
+            return;
         }
 
-        var voiceless = await args.Guild.GetMemberAsync(sender.CurrentUser.Id);
+        // Get target user in this channel and set nickname accordingly
+        var users = UsersOfInterestForServer(guild.Id);
+        var targetUsers = targetChannel.Users.Where(x =>
+            users.Contains(x.Id) && x.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false }).ToList();
+        
         switch (targetUsers.Count)
         {
             case 0:
                 await voiceless.ModifyAsync(x => x.Nickname = "Voiceless");
-                return;
+                break;
             case 1:
                 await voiceless.ModifyAsync(x =>
-                    x.Nickname = $"{targetUsers[0].Nickname[..Math.Min(26, targetUsers[0].Nickname.Length)]}'s Mic");
+                    x.Nickname =
+                        $"{targetUsers[0].DisplayName[..Math.Min(26, targetUsers[0].DisplayName.Length)]}'s Mic");
                 break;
             default:
                 await voiceless.ModifyAsync(x => x.Nickname = "Multi-User Mic");
