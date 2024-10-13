@@ -38,6 +38,7 @@ public static partial class Program
     private static HashSet<ulong> _channelsOfInterest = [];
     private static HashSet<ulong> _serversOfInterest = [];
     private static ConcurrentDictionary<ulong, string> _voices = [];
+    private static ConcurrentDictionary<ulong, HashSet<ulong>> _channelsForUser = [];
 
     public static async Task Main()
     {
@@ -64,6 +65,8 @@ public static partial class Program
         _serversOfInterest = [..targetConfig.Users.SelectMany(x => x.Servers).Select(x => x.Server).Distinct()];
         _voices = new ConcurrentDictionary<ulong, string>(targetConfig.Users.Select(x =>
             new KeyValuePair<ulong, string>(x.User, x.Voice)));
+        _channelsForUser = new ConcurrentDictionary<ulong, HashSet<ulong>>(targetConfig.Users.Select(x =>
+            new KeyValuePair<ulong, HashSet<ulong>>(x.User, x.Servers.SelectMany(y => y.Channels).ToHashSet())));
         foreach (var server in _serversOfInterest)
         {
             MessageQueues[server] = new ConcurrentQueue<QueuedMessage>();
@@ -129,13 +132,13 @@ public static partial class Program
             {
                 continue;
             }
-            
+
             // Get target channel, if any, if none is found don't go further
             await SetNickname(sender, foundServer);
             var targetChannel = await GetTargetChannel(sender, foundServer);
             if (targetChannel is null)
                 continue;
-            
+
             // Connect to target channel
             await targetChannel.ConnectAsync();
         }
@@ -143,8 +146,30 @@ public static partial class Program
 
     private static async Task MessageCreated(DiscordClient sender, MessageCreatedEventArgs args)
     {
-        if (!_channelsOfInterest.Contains(args.Channel.Id) && !_personsOfInterest.Contains(args.Author.Id))
+        if (!_personsOfInterest.Contains(args.Author.Id) || !_serversOfInterest.Contains(args.Guild.Id))
             return;
+        
+        var rawMessage = args.Message.Content;
+        
+        // Check if this is to check for listened channels
+        if (rawMessage.Equals(".listening", StringComparison.InvariantCultureIgnoreCase))
+        {
+            var listenedChannels = GetConfiguration<TargetConfiguration>("target").Users
+                .First(x => x.User == args.Author.Id).Servers.First(x => x.Server == args.Guild.Id).Channels;
+            await args.Channel.SendMessageAsync(
+                $"I'm currently listening to the following channels: {string.Join(",", listenedChannels.Select(x => $"<#{x}>"))}");
+            return;
+        }
+
+        // Outside of anything above, ignore any non-listened channel
+        if (!_channelsForUser[args.Author.Id].Contains(args.Channel.Id))
+            return;
+
+        // Determine if this message should be skipped based on configured skip prefix or current state
+        var miscConfig = GetConfiguration<MiscConfiguration>("misc");
+        if (rawMessage.StartsWith(miscConfig.Silencer))
+            return;
+        
         var vcChannel = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild);
         if (vcChannel == null)
             return;
@@ -153,14 +178,7 @@ public static partial class Program
         if (!vcChannel.TargetChannel.Users.Any(x =>
                 x.Id == args.Author.Id && x.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false }))
             return;
-
-        var rawMessage = args.Message.Content;
-
-        // Determine if this message should be skipped based on configured skip prefix or current state
-        var miscConfig = GetConfiguration<MiscConfiguration>("misc");
-        if (rawMessage.StartsWith(miscConfig.Silencer))
-            return;
-
+        
         // Handle mentioned users
         foreach (var mention in args.Message.MentionedUsers)
         {
@@ -275,7 +293,7 @@ public static partial class Program
 
         // Set nickname if an update is needed
         await SetNickname(sender, args.Guild);
-        
+
         var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>()
             .GetConnection(args.Guild);
         var target = await GetTargetChannel(sender, args.Guild);
@@ -357,7 +375,7 @@ public static partial class Program
         var users = UsersOfInterestForServer(guild.Id);
         var targetUsers = targetChannel.Users.Where(x =>
             users.Contains(x.Id) && x.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false }).ToList();
-        
+
         switch (targetUsers.Count)
         {
             case 0:
