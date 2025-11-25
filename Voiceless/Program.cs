@@ -38,6 +38,7 @@ public static partial class Program
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentQueue<QueuedMessage>> MessageQueues = new();
     private static readonly ConcurrentDictionary<ulong, VoiceClient> VoiceConnections = new();
+    private static readonly ConcurrentDictionary<ulong, ulong> VoiceChannelIds = new();
     private static readonly SemaphoreSlim VoiceConnectionLock = new(1, 1);
     private static HashSet<ulong> _personsOfInterest = [];
     private static HashSet<ulong> _channelsOfInterest = [];
@@ -327,7 +328,6 @@ public static partial class Program
         // Set nickname if an update is needed
         await SetNickname(guild);
 
-        var existingConnection = VoiceConnections.TryGetValue(voiceState.GuildId, out var vc) ? vc : null;
         var target = await GetTargetChannel(guild);
         
         if (target is null)
@@ -337,15 +337,12 @@ public static partial class Program
         }
 
         // If we're already in the target channel, don't change anything
-        if (existingConnection != null && VoiceConnections.TryGetValue(voiceState.GuildId, out _))
+        if (VoiceChannelIds.TryGetValue(voiceState.GuildId, out var currentChannelId) && currentChannelId == target.Id)
         {
-            // Check if we need to move to a different channel
-            // For now, we'll just verify we have a connection
             return;
         }
 
-        // Connect to the new target channel
-        await DisconnectFromVoiceChannel(voiceState.GuildId);
+        // Connect to the new target channel (this will disconnect from current channel first)
         await ConnectToVoiceChannel(voiceState.GuildId, target.Id);
     }
 
@@ -392,11 +389,14 @@ public static partial class Program
         var topScore = channels[0].score;
         channels = channels.Where(x => x.score == topScore).ToList();
         
-        // Check if we're already connected to one of these channels
-        if (VoiceConnections.TryGetValue(guild.Id, out _))
+        // If we're already connected to one of the top-scoring channels, prefer staying there
+        if (VoiceChannelIds.TryGetValue(guild.Id, out var currentChannelId))
         {
-            // For now, just return the first channel with the highest score
-            // In a more sophisticated implementation, we could track which channel we're in
+            var currentChannel = channels.FirstOrDefault(c => c.value.Id == currentChannelId);
+            if (currentChannel != null)
+            {
+                return Task.FromResult<IGuildChannel?>(currentChannel.value);
+            }
         }
 
         // Just return the first entry as we have no other tie breaker at the moment
@@ -487,6 +487,7 @@ public static partial class Program
             await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone));
 
             VoiceConnections[guildId] = voiceClient;
+            VoiceChannelIds[guildId] = channelId;
         }
         finally
         {
@@ -509,6 +510,7 @@ public static partial class Program
 
     private static async Task DisconnectFromVoiceChannelUnsafe(ulong guildId)
     {
+        VoiceChannelIds.TryRemove(guildId, out _);
         if (VoiceConnections.TryRemove(guildId, out var voiceClient))
         {
             try
