@@ -11,6 +11,7 @@ using NetCord.Gateway.Voice;
 using NetCord.Rest;
 using OpenAI;
 using OpenAI.Chat;
+using Serilog;
 using Voiceless.Configuration;
 using Voiceless.Data;
 using Voiceless.Voice;
@@ -48,72 +49,106 @@ public static partial class Program
 
     public static async Task Main()
     {
-        // Get config
-        var builder = new ConfigurationBuilder()
-            .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true, reloadOnChange: true);
-        _configuration = builder.Build();
+        // Configure Serilog - use Information level by default for reasonable output
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+            .CreateLogger();
 
-        // Grab configuration objects
-        var discordConfig = GetConfiguration<DiscordConfiguration>("discord");
-        var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
-
-        _openAi = new OpenAIClient(new ApiKeyCredential(openAIConfig?.Token ??
-                                                        throw new InvalidOperationException(
-                                                            "Invalid configuration, missing OpenAI API token")),
-            new OpenAIClientOptions());
-
-        // Perform target setup
-        var targetConfig = GetConfiguration<TargetConfiguration>("target");
-        _personsOfInterest = [..targetConfig.Users.Select(x => x.User).Distinct()];
-        _channelsOfInterest = [..targetConfig.Users.SelectMany(x => x.Servers).SelectMany(x => x.Channels).Distinct()];
-        _serversOfInterest = [..targetConfig.Users.SelectMany(x => x.Servers).Select(x => x.Server).Distinct()];
-        _voices = new ConcurrentDictionary<ulong, string>(targetConfig.Users.Select(x =>
-            new KeyValuePair<ulong, string>(x.User, x.Voice)));
-        _channelsForUser = new ConcurrentDictionary<ulong, HashSet<ulong>>(targetConfig.Users.Select(x =>
-            new KeyValuePair<ulong, HashSet<ulong>>(x.User, x.Servers.SelectMany(y => y.Channels).ToHashSet())));
-        foreach (var server in _serversOfInterest)
+        try
         {
-            MessageQueues[server] = new ConcurrentQueue<QueuedMessage>();
+            Log.Information("Voiceless starting up...");
+
+            // Get config
+            var builder = new ConfigurationBuilder()
+                .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true, reloadOnChange: true);
+            _configuration = builder.Build();
+
+            // Grab configuration objects
+            var discordConfig = GetConfiguration<DiscordConfiguration>("discord");
+            var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
+
+            _openAi = new OpenAIClient(new ApiKeyCredential(openAIConfig?.Token ??
+                                                            throw new InvalidOperationException(
+                                                                "Invalid configuration, missing OpenAI API token")),
+                new OpenAIClientOptions());
+
+            // Perform target setup
+            var targetConfig = GetConfiguration<TargetConfiguration>("target");
+            _personsOfInterest = [..targetConfig.Users.Select(x => x.User).Distinct()];
+            _channelsOfInterest = [..targetConfig.Users.SelectMany(x => x.Servers).SelectMany(x => x.Channels).Distinct()];
+            _serversOfInterest = [..targetConfig.Users.SelectMany(x => x.Servers).Select(x => x.Server).Distinct()];
+            _voices = new ConcurrentDictionary<ulong, string>(targetConfig.Users.Select(x =>
+                new KeyValuePair<ulong, string>(x.User, x.Voice)));
+            _channelsForUser = new ConcurrentDictionary<ulong, HashSet<ulong>>(targetConfig.Users.Select(x =>
+                new KeyValuePair<ulong, HashSet<ulong>>(x.User, x.Servers.SelectMany(y => y.Channels).ToHashSet())));
+            foreach (var server in _serversOfInterest)
+            {
+                MessageQueues[server] = new ConcurrentQueue<QueuedMessage>();
+            }
+
+            Log.Information("Configuration loaded. Monitoring {UserCount} users across {ServerCount} servers", 
+                _personsOfInterest.Count, _serversOfInterest.Count);
+
+            // Use ElevenLabs when available
+            var elevenLabsConfig = GetConfiguration<ElevenLabsConfiguration>("elevenlabs");
+            if (!string.IsNullOrEmpty(elevenLabsConfig?.Token))
+            {
+                Log.Information("Using ElevenLabs for TTS synthesis");
+                var synth = new ElevenLabsVoiceSynthesizer(elevenLabsConfig);
+                await synth.ConfigureClient();
+                _voiceSynth = synth;
+            }
+            else
+            {
+                Log.Information("Using OpenAI for TTS synthesis");
+                _voiceSynth = new OpenAIVoiceSynthesizer(_openAi, openAIConfig);
+            }
+
+            // Create the REST client for API operations
+            _restClient = new RestClient(new BotToken(discordConfig?.Token ??
+                                                       throw new InvalidOperationException(
+                                                           "Invalid configuration, missing Discord bot token")));
+
+            // Create and configure the Gateway client
+            _discord = new GatewayClient(new BotToken(discordConfig.Token), new GatewayClientConfiguration
+            {
+                Intents = GatewayIntents.Guilds | GatewayIntents.GuildMessages | GatewayIntents.MessageContent |
+                          GatewayIntents.GuildVoiceStates | GatewayIntents.GuildUsers
+            });
+
+            // Subscribe to events
+            _discord.Ready += OnReady;
+            _discord.MessageCreate += OnMessageCreate;
+            _discord.VoiceStateUpdate += OnVoiceStateUpdate;
+            _discord.GuildUserUpdate += OnGuildMemberUpdate;
+
+            Log.Information("Connecting to Discord...");
+
+            // Connect and run
+            await _discord.StartAsync();
+            
+            Log.Information("Connected to Discord Gateway. Bot is now running.");
+            
+            await Task.Delay(Timeout.Infinite);
         }
-
-        // Use ElevenLabs when available
-        var elevenLabsConfig = GetConfiguration<ElevenLabsConfiguration>("elevenlabs");
-        if (!string.IsNullOrEmpty(elevenLabsConfig?.Token))
+        catch (Exception ex)
         {
-            var synth = new ElevenLabsVoiceSynthesizer(elevenLabsConfig);
-            await synth.ConfigureClient();
-            _voiceSynth = synth;
+            Log.Fatal(ex, "Application terminated unexpectedly");
         }
-        else
-            _voiceSynth = new OpenAIVoiceSynthesizer(_openAi, openAIConfig);
-
-        // Create the REST client for API operations
-        _restClient = new RestClient(new BotToken(discordConfig?.Token ??
-                                                   throw new InvalidOperationException(
-                                                       "Invalid configuration, missing Discord bot token")));
-
-        // Create and configure the Gateway client
-        _discord = new GatewayClient(new BotToken(discordConfig.Token), new GatewayClientConfiguration
+        finally
         {
-            Intents = GatewayIntents.Guilds | GatewayIntents.GuildMessages | GatewayIntents.MessageContent |
-                      GatewayIntents.GuildVoiceStates | GatewayIntents.GuildUsers
-        });
-
-        // Subscribe to events
-        _discord.Ready += OnReady;
-        _discord.MessageCreate += OnMessageCreate;
-        _discord.VoiceStateUpdate += OnVoiceStateUpdate;
-        _discord.GuildUserUpdate += OnGuildMemberUpdate;
-
-        // Connect and run
-        await _discord.StartAsync();
-        await Task.Delay(Timeout.Infinite);
+            await Log.CloseAndFlushAsync();
+        }
     }
 
     private static async ValueTask OnReady(ReadyEventArgs args)
     {
+        Log.Information("Discord Ready event received. Bot user: {Username}#{Discriminator}", 
+            args.User.Username, args.User.Discriminator);
+        
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
         // Update nickname in target servers
@@ -129,17 +164,36 @@ public static partial class Program
             }
         }
 
+        Log.Debug("Processing {ServerCount} configured servers", servers.Count);
+
         foreach (var server in servers)
         {
             if (!_discord.Cache.Guilds.TryGetValue(server.Key, out var foundServer))
+            {
+                Log.Warning("Server {ServerId} not found in cache", server.Key);
                 continue;
+            }
+
+            Log.Debug("Processing server: {ServerName} ({ServerId})", foundServer.Name, foundServer.Id);
+            Log.Debug("Voice states in server: {VoiceStateCount}", foundServer.VoiceStates.Count);
+            
+            foreach (var vs in foundServer.VoiceStates)
+            {
+                Log.Debug("  Voice state - User: {UserId}, Channel: {ChannelId}", vs.Key, vs.Value.ChannelId);
+            }
 
             // Get target channel, if any, if none is found don't go further
             await SetNickname(foundServer);
             var targetChannel = await GetTargetChannel(foundServer);
             if (targetChannel is null)
+            {
+                Log.Debug("No target channel found for server {ServerName}", foundServer.Name);
                 continue;
+            }
 
+            Log.Information("Connecting to voice channel {ChannelName} ({ChannelId}) in {ServerName}", 
+                targetChannel.Name, targetChannel.Id, foundServer.Name);
+            
             // Connect to target channel
             await ConnectToVoiceChannel(foundServer.Id, targetChannel.Id);
         }
@@ -156,6 +210,9 @@ public static partial class Program
         if (!_personsOfInterest.Contains(message.Author.Id) || !_serversOfInterest.Contains(guildId))
             return;
         
+        Log.Debug("OnMessageCreate: Message from user {UserId} in guild {GuildId}: {Content}", 
+            message.Author.Id, guildId, message.Content.Length > 50 ? message.Content[..50] + "..." : message.Content);
+        
         var rawMessage = message.Content;
         
         // Check if this is to check for listened channels
@@ -170,27 +227,44 @@ public static partial class Program
 
         // Outside of anything above, ignore any non-listened channel
         if (!_channelsForUser[message.Author.Id].Contains(message.ChannelId))
+        {
+            Log.Debug("OnMessageCreate: Channel {ChannelId} not in listened channels for user", message.ChannelId);
             return;
+        }
 
         // Determine if this message should be skipped based on configured skip prefix or current state
         var miscConfig = GetConfiguration<MiscConfiguration>("misc");
         if (rawMessage.StartsWith(miscConfig.Silencer))
+        {
+            Log.Debug("OnMessageCreate: Message starts with silencer prefix, skipping");
             return;
+        }
         
         // Check if we have a voice connection for this guild
         if (!VoiceConnections.TryGetValue(guildId, out var voiceClient))
+        {
+            Log.Debug("OnMessageCreate: No voice connection for guild {GuildId}", guildId);
             return;
+        }
 
         // Get the guild from cache
         if (!_discord.Cache.Guilds.TryGetValue(guildId, out var guild))
+        {
+            Log.Warning("OnMessageCreate: Guild {GuildId} not found in cache", guildId);
             return;
+        }
 
         // If the user is not in the vc channel, or not undeafened, ignore them
         if (!guild.VoiceStates.TryGetValue(message.Author.Id, out var userVoiceState) || 
             !userVoiceState.ChannelId.HasValue ||
             userVoiceState.IsSelfDeafened || 
             userVoiceState.IsDeafened)
+        {
+            Log.Debug("OnMessageCreate: User {UserId} not in voice or is deafened", message.Author.Id);
             return;
+        }
+        
+        Log.Information("OnMessageCreate: Processing TTS for message from {UserId}", message.Author.Id);
         
         // Handle mentioned users
         if (message.MentionedUsers != null)
@@ -256,10 +330,15 @@ public static partial class Program
             rawMessage = await ApplyFlavorPrompt(rawMessage);
 
         // Perform TTS conversion
+        Log.Debug("OnMessageCreate: Synthesizing TTS for message");
         var audioResult = await _voiceSynth.SynthesizeTextToSpeechAsync(rawMessage, _voices[message.Author.Id]);
         if (audioResult == null)
+        {
+            Log.Warning("OnMessageCreate: TTS synthesis returned null");
             return;
+        }
 
+        Log.Debug("OnMessageCreate: Enqueueing audio for playback");
         MessageQueues[guildId].Enqueue(new QueuedMessage(audioResult, guildId, _voiceSynth.AudioFormat));
         if (MessageQueues[guildId].Count == 1)
             await ProcessMessageQueue(guildId);
@@ -282,18 +361,28 @@ public static partial class Program
 
     private static async Task ProcessMessageQueue(ulong guildId)
     {
+        Log.Debug("ProcessMessageQueue: Starting to process queue for guild {GuildId}", guildId);
+        
         while (MessageQueues[guildId].TryPeek(out var task))
         {
             // Check if we have a voice connection for this guild
             if (VoiceConnections.TryGetValue(guildId, out var voiceClient))
             {
+                Log.Debug("ProcessMessageQueue: Sending audio to voice channel");
                 await SendAudioToVoiceChannel(task.Stream, voiceClient, task.AudioFormat);
+                Log.Debug("ProcessMessageQueue: Audio sent successfully");
+            }
+            else
+            {
+                Log.Warning("ProcessMessageQueue: No voice connection available for guild {GuildId}", guildId);
             }
             task.Stream.Close();
 
             // Get rid of the item we were processing afterwards
             MessageQueues[guildId].TryDequeue(out _);
         }
+        
+        Log.Debug("ProcessMessageQueue: Queue processing complete for guild {GuildId}", guildId);
     }
 
     private static async Task<string> DescribeAttachments(IEnumerable<Attachment> attachments)
@@ -318,13 +407,24 @@ public static partial class Program
 
     private static async ValueTask OnVoiceStateUpdate(VoiceState voiceState)
     {
+        Log.Debug("VoiceStateUpdate: User {UserId} in Guild {GuildId}, Channel: {ChannelId}", 
+            voiceState.UserId, voiceState.GuildId, voiceState.ChannelId);
+        
         if (!_personsOfInterest.Contains(voiceState.UserId) || !_serversOfInterest.Contains(voiceState.GuildId))
+        {
+            Log.Debug("VoiceStateUpdate: User {UserId} not a person of interest or server not monitored", voiceState.UserId);
             return;
+        }
 
         // Get guild from cache
         if (!_discord.Cache.Guilds.TryGetValue(voiceState.GuildId, out var guild))
+        {
+            Log.Warning("VoiceStateUpdate: Guild {GuildId} not found in cache", voiceState.GuildId);
             return;
+        }
 
+        Log.Debug("VoiceStateUpdate: Processing for guild {GuildName}", guild.Name);
+        
         // Set nickname if an update is needed
         await SetNickname(guild);
 
@@ -332,16 +432,23 @@ public static partial class Program
         
         if (target is null)
         {
+            Log.Debug("VoiceStateUpdate: No target channel found, disconnecting from guild {GuildName}", guild.Name);
             await DisconnectFromVoiceChannel(voiceState.GuildId);
             return;
         }
 
+        Log.Debug("VoiceStateUpdate: Target channel is {ChannelName} ({ChannelId})", target.Name, target.Id);
+
         // If we're already in the target channel, don't change anything
         if (VoiceChannelIds.TryGetValue(voiceState.GuildId, out var currentChannelId) && currentChannelId == target.Id)
         {
+            Log.Debug("VoiceStateUpdate: Already in target channel {ChannelId}", currentChannelId);
             return;
         }
 
+        Log.Information("VoiceStateUpdate: Connecting to voice channel {ChannelName} in {GuildName}", 
+            target.Name, guild.Name);
+        
         // Connect to the new target channel (this will disconnect from current channel first)
         await ConnectToVoiceChannel(voiceState.GuildId, target.Id);
     }
@@ -426,6 +533,7 @@ public static partial class Program
         if (targetChannel is null)
         {
             nickname = "Voiceless";
+            Log.Debug("SetNickname: No target channel, setting nickname to 'Voiceless' in {GuildName}", guild.Name);
         }
         else
         {
@@ -437,21 +545,27 @@ public static partial class Program
                             !vs.IsDeafened)
                 .ToList();
 
+            Log.Debug("SetNickname: Found {UserCount} undeafened target users in channel {ChannelName}", 
+                targetUsers.Count, targetChannel.Name);
+
             nickname = targetUsers.Count switch
             {
                 0 => "Voiceless",
                 1 => GetNicknameForUser(guild, targetUsers[0].UserId),
                 _ => "Multi-User Mic"
             };
+            
+            Log.Debug("SetNickname: Setting nickname to '{Nickname}' in {GuildName}", nickname, guild.Name);
         }
 
         try
         {
             await _restClient.ModifyCurrentGuildUserAsync(guild.Id, x => x.Nickname = nickname);
+            Log.Information("Set nickname to '{Nickname}' in {GuildName}", nickname, guild.Name);
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore errors when setting nickname (e.g., missing permissions)
+            Log.Warning(ex, "Failed to set nickname in {GuildName}", guild.Name);
         }
     }
 
@@ -471,23 +585,41 @@ public static partial class Program
 
     private static async Task ConnectToVoiceChannel(ulong guildId, ulong channelId)
     {
+        Log.Debug("ConnectToVoiceChannel: Attempting to connect to channel {ChannelId} in guild {GuildId}", 
+            channelId, guildId);
+        
         await VoiceConnectionLock.WaitAsync();
         try
         {
             // Disconnect any existing connection first
             await DisconnectFromVoiceChannelUnsafe(guildId);
 
+            Log.Debug("ConnectToVoiceChannel: Joining voice channel...");
+            
             // Join the voice channel
             var voiceClient = await _discord.JoinVoiceChannelAsync(guildId, channelId);
 
+            Log.Debug("ConnectToVoiceChannel: Starting voice client...");
+            
             // Start the voice client
             await voiceClient.StartAsync();
 
+            Log.Debug("ConnectToVoiceChannel: Entering speaking state...");
+            
             // Enter speaking state
             await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone));
 
             VoiceConnections[guildId] = voiceClient;
             VoiceChannelIds[guildId] = channelId;
+            
+            Log.Information("ConnectToVoiceChannel: Successfully connected to channel {ChannelId} in guild {GuildId}", 
+                channelId, guildId);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "ConnectToVoiceChannel: Failed to connect to channel {ChannelId} in guild {GuildId}", 
+                channelId, guildId);
+            throw;
         }
         finally
         {
@@ -497,10 +629,13 @@ public static partial class Program
 
     private static async Task DisconnectFromVoiceChannel(ulong guildId)
     {
+        Log.Debug("DisconnectFromVoiceChannel: Disconnecting from guild {GuildId}", guildId);
+        
         await VoiceConnectionLock.WaitAsync();
         try
         {
             await DisconnectFromVoiceChannelUnsafe(guildId);
+            Log.Information("DisconnectFromVoiceChannel: Disconnected from guild {GuildId}", guildId);
         }
         finally
         {
@@ -516,10 +651,11 @@ public static partial class Program
             try
             {
                 await voiceClient.CloseAsync();
+                Log.Debug("DisconnectFromVoiceChannelUnsafe: Closed voice client for guild {GuildId}", guildId);
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore errors during disconnection
+                Log.Warning(ex, "DisconnectFromVoiceChannelUnsafe: Error closing voice client for guild {GuildId}", guildId);
             }
         }
     }
