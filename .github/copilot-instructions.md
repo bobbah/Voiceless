@@ -6,7 +6,7 @@
 
 - **Language**: C# 13 with .NET 9.0
 - **Type**: Console application (Discord bot)
-- **Size**: Small (~15 source files)
+- **Size**: Small (~12 source files)
 - **External Dependencies**: OpenAI API, ElevenLabs API (optional), Discord Bot Token, FFmpeg (runtime)
 
 ## Build Instructions
