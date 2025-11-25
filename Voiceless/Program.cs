@@ -663,15 +663,22 @@ public static partial class Program
 
     private static async Task SendAudioToVoiceChannel(Stream inputStream, VoiceClient voiceClient, string audioFormat)
     {
-        Log.Debug("SendAudioToVoiceChannel: Starting audio transmission, format: {Format}", audioFormat);
+        var streamLength = inputStream.CanSeek ? inputStream.Length : -1;
+        Log.Debug("SendAudioToVoiceChannel: Starting audio transmission, format: {Format}, input stream length: {Length}", 
+            audioFormat, streamLength);
         
         // Create the output stream for sending to Discord
+        Log.Debug("SendAudioToVoiceChannel: Creating Discord output stream...");
         var outStream = voiceClient.CreateOutputStream();
+        Log.Debug("SendAudioToVoiceChannel: Discord output stream created");
 
         // Create Opus encode stream to convert PCM to Opus
+        Log.Debug("SendAudioToVoiceChannel: Creating Opus encode stream...");
         await using var opusStream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
+        Log.Debug("SendAudioToVoiceChannel: Opus encode stream created");
 
         // Start FFmpeg to convert input audio to PCM
+        Log.Debug("SendAudioToVoiceChannel: Creating FFmpeg process start info...");
         var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
@@ -697,6 +704,7 @@ public static partial class Program
         startInfo.ArgumentList.Add("48000");
         startInfo.ArgumentList.Add("pipe:1");
 
+        Log.Debug("SendAudioToVoiceChannel: Starting FFmpeg process...");
         var ffmpeg = Process.Start(startInfo);
 
         if (ffmpeg is null)
@@ -717,6 +725,10 @@ public static partial class Program
                 {
                     Log.Warning("SendAudioToVoiceChannel: FFmpeg stderr: {Stderr}", stderr);
                 }
+                else
+                {
+                    Log.Debug("SendAudioToVoiceChannel: FFmpeg stderr was empty");
+                }
             });
 
             // Have to do input and output at the same time otherwise output buffer fills and waits
@@ -724,10 +736,20 @@ public static partial class Program
             {
                 try
                 {
-                    Log.Debug("SendAudioToVoiceChannel: Starting to write input to FFmpeg");
-                    inputStream.Seek(0, SeekOrigin.Begin);
+                    Log.Debug("SendAudioToVoiceChannel: Starting to write input to FFmpeg, stream can seek: {CanSeek}", inputStream.CanSeek);
+                    if (inputStream.CanSeek)
+                    {
+                        inputStream.Seek(0, SeekOrigin.Begin);
+                        Log.Debug("SendAudioToVoiceChannel: Stream reset to beginning, copying {Length} bytes to FFmpeg stdin", inputStream.Length);
+                    }
+                    else
+                    {
+                        Log.Debug("SendAudioToVoiceChannel: Stream does not support seeking, copying to FFmpeg stdin");
+                    }
                     await inputStream.CopyToAsync(ffmpeg.StandardInput.BaseStream).ConfigureAwait(false);
+                    Log.Debug("SendAudioToVoiceChannel: Copied data to FFmpeg stdin, flushing...");
                     await ffmpeg.StandardInput.BaseStream.FlushAsync().ConfigureAwait(false);
+                    Log.Debug("SendAudioToVoiceChannel: Flushed FFmpeg stdin, closing...");
                     ffmpeg.StandardInput.Close();
                     Log.Debug("SendAudioToVoiceChannel: Finished writing input to FFmpeg");
                 }
@@ -742,7 +764,7 @@ public static partial class Program
             {
                 try
                 {
-                    Log.Debug("SendAudioToVoiceChannel: Starting to read output from FFmpeg");
+                    Log.Debug("SendAudioToVoiceChannel: Starting to read output from FFmpeg and copy to opus stream");
                     await ffmpeg.StandardOutput.BaseStream.CopyToAsync(opusStream).ConfigureAwait(false);
                     Log.Debug("SendAudioToVoiceChannel: Finished reading output from FFmpeg");
                 }
@@ -753,6 +775,7 @@ public static partial class Program
                 }
             });
 
+            Log.Debug("SendAudioToVoiceChannel: Waiting for input and output tasks to complete...");
             // Wait for both input and output to complete
             await Task.WhenAll(inputTask, outputTask).ConfigureAwait(false);
             
