@@ -662,6 +662,8 @@ public static partial class Program
 
     private static async Task SendAudioToVoiceChannel(Stream inputStream, VoiceClient voiceClient, string audioFormat)
     {
+        Log.Debug("SendAudioToVoiceChannel: Starting audio transmission, format: {Format}", audioFormat);
+        
         // Create the output stream for sending to Discord
         var outStream = voiceClient.CreateOutputStream();
 
@@ -669,37 +671,133 @@ public static partial class Program
         await using var opusStream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
 
         // Start FFmpeg to convert input audio to PCM
-        var ffmpeg = Process.Start(new ProcessStartInfo
+        var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
-            Arguments = $"-f {audioFormat} -i pipe:0 -ac 2 -f s16le -ar 48000 pipe:1",
             RedirectStandardOutput = true,
             RedirectStandardInput = true,
-            UseShellExecute = false
-        });
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        
+        // Build arguments
+        startInfo.ArgumentList.Add("-f");
+        startInfo.ArgumentList.Add(audioFormat);
+        startInfo.ArgumentList.Add("-i");
+        startInfo.ArgumentList.Add("pipe:0");
+        startInfo.ArgumentList.Add("-loglevel");
+        startInfo.ArgumentList.Add("error");
+        startInfo.ArgumentList.Add("-ac");
+        startInfo.ArgumentList.Add("2");
+        startInfo.ArgumentList.Add("-f");
+        startInfo.ArgumentList.Add("s16le");
+        startInfo.ArgumentList.Add("-ar");
+        startInfo.ArgumentList.Add("48000");
+        startInfo.ArgumentList.Add("pipe:1");
+
+        var ffmpeg = Process.Start(startInfo);
 
         if (ffmpeg is null)
+        {
+            Log.Error("SendAudioToVoiceChannel: Failed to create FFmpeg instance!");
             throw new InvalidOperationException("Failed to create FFmpeg instance!");
+        }
 
-        // Have to do input and output at the same time otherwise output buffer fills and waits
-        var inputTask = Task.Run(async () =>
+        Log.Debug("SendAudioToVoiceChannel: FFmpeg process started (PID: {Pid})", ffmpeg.Id);
+
+        try
         {
-            inputStream.Seek(0, SeekOrigin.Begin);
-            await inputStream.CopyToAsync(ffmpeg.StandardInput.BaseStream);
-            ffmpeg.StandardInput.Close();
-        });
+            // Read stderr in background to prevent buffer blocking
+            var stderrTask = Task.Run(async () =>
+            {
+                var stderr = await ffmpeg.StandardError.ReadToEndAsync().ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(stderr))
+                {
+                    Log.Warning("SendAudioToVoiceChannel: FFmpeg stderr: {Stderr}", stderr);
+                }
+            });
 
-        var outputTask = Task.Run(async () =>
+            // Have to do input and output at the same time otherwise output buffer fills and waits
+            var inputTask = Task.Run(async () =>
+            {
+                try
+                {
+                    Log.Debug("SendAudioToVoiceChannel: Starting to write input to FFmpeg");
+                    inputStream.Seek(0, SeekOrigin.Begin);
+                    await inputStream.CopyToAsync(ffmpeg.StandardInput.BaseStream).ConfigureAwait(false);
+                    await ffmpeg.StandardInput.BaseStream.FlushAsync().ConfigureAwait(false);
+                    ffmpeg.StandardInput.Close();
+                    Log.Debug("SendAudioToVoiceChannel: Finished writing input to FFmpeg");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "SendAudioToVoiceChannel: Error writing to FFmpeg stdin");
+                    throw;
+                }
+            });
+
+            var outputTask = Task.Run(async () =>
+            {
+                try
+                {
+                    Log.Debug("SendAudioToVoiceChannel: Starting to read output from FFmpeg");
+                    await ffmpeg.StandardOutput.BaseStream.CopyToAsync(opusStream).ConfigureAwait(false);
+                    Log.Debug("SendAudioToVoiceChannel: Finished reading output from FFmpeg");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "SendAudioToVoiceChannel: Error reading from FFmpeg stdout");
+                    throw;
+                }
+            });
+
+            // Wait for both input and output to complete
+            await Task.WhenAll(inputTask, outputTask).ConfigureAwait(false);
+            
+            Log.Debug("SendAudioToVoiceChannel: Input and output tasks completed, waiting for FFmpeg to exit");
+            
+            // Wait for FFmpeg with a timeout using CancellationToken
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                await ffmpeg.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                Log.Debug("SendAudioToVoiceChannel: FFmpeg exited with code {ExitCode}", ffmpeg.ExitCode);
+            }
+            catch (OperationCanceledException)
+            {
+                Log.Warning("SendAudioToVoiceChannel: FFmpeg did not exit within timeout, killing process");
+                ffmpeg.Kill();
+            }
+
+            // Wait for stderr reading to complete
+            await stderrTask.ConfigureAwait(false);
+
+            // Flush to ensure all data is sent
+            Log.Debug("SendAudioToVoiceChannel: Flushing opus stream");
+            await opusStream.FlushAsync().ConfigureAwait(false);
+            
+            Log.Debug("SendAudioToVoiceChannel: Audio transmission complete");
+        }
+        catch (Exception ex)
         {
-            await ffmpeg.StandardOutput.BaseStream.CopyToAsync(opusStream);
-            ffmpeg.StandardOutput.Close();
-        });
-
-        await Task.WhenAll(inputTask, outputTask);
-        await ffmpeg.WaitForExitAsync();
-
-        // Flush to ensure all data is sent
-        await opusStream.FlushAsync();
+            Log.Error(ex, "SendAudioToVoiceChannel: Error during audio transmission");
+            
+            // Try to kill FFmpeg if it's still running
+            try
+            {
+                if (!ffmpeg.HasExited)
+                {
+                    ffmpeg.Kill();
+                }
+            }
+            catch (Exception cleanupEx)
+            {
+                Log.Debug(cleanupEx, "SendAudioToVoiceChannel: Error during FFmpeg cleanup");
+            }
+            
+            throw;
+        }
     }
 
     private static T GetConfiguration<T>(string section) where T : class, new()
