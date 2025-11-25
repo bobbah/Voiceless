@@ -288,15 +288,16 @@ public static partial class Program
 
     private static async Task VoiceStateUpdated(DiscordClient sender, VoiceStateUpdatedEventArgs args)
     {
-        if (!_personsOfInterest.Contains(args.User.Id) || !_serversOfInterest.Contains(args.Guild.Id))
+        if (!_personsOfInterest.Contains(args.UserId) || !_serversOfInterest.Contains(args.GuildId.Value))
             return;
 
         // Set nickname if an update is needed
-        await SetNickname(sender, args.Guild);
+        var guild = await args.GetGuildAsync();
+        await SetNickname(sender, guild);
 
         var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>()
-            .GetConnection(args.Guild);
-        var target = await GetTargetChannel(sender, args.Guild);
+            .GetConnection(guild);
+        var target = await GetTargetChannel(sender, guild);
         if (target is null)
         {
             existingConnection?.Disconnect();
