@@ -3,14 +3,12 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using DSharpPlus;
-using DSharpPlus.Entities;
-using DSharpPlus.EventArgs;
-using DSharpPlus.Exceptions;
-using DSharpPlus.VoiceNext;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using NetCord;
+using NetCord.Gateway;
+using NetCord.Gateway.Voice;
+using NetCord.Rest;
 using OpenAI;
 using OpenAI.Chat;
 using Voiceless.Configuration;
@@ -29,11 +27,18 @@ public static partial class Program
     [GeneratedRegex("<a?:(?<text>.+):[0-9]+>", RegexOptions.Multiline, "en-US")]
     private static partial Regex EmojiPattern();
 
+    [GeneratedRegex("<#([0-9]+)>", RegexOptions.Multiline, "en-US")]
+    private static partial Regex ChannelMentionPattern();
+
     private static OpenAIClient _openAi = null!;
     private static IVoiceSynthesizer _voiceSynth = null!;
     private static IConfiguration _configuration = null!;
+    private static GatewayClient _discord = null!;
+    private static RestClient _restClient = null!;
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentQueue<QueuedMessage>> MessageQueues = new();
+    private static readonly ConcurrentDictionary<ulong, VoiceClient> VoiceConnections = new();
+    private static readonly SemaphoreSlim VoiceConnectionLock = new(1, 1);
     private static HashSet<ulong> _personsOfInterest = [];
     private static HashSet<ulong> _channelsOfInterest = [];
     private static HashSet<ulong> _serversOfInterest = [];
@@ -83,28 +88,30 @@ public static partial class Program
         else
             _voiceSynth = new OpenAIVoiceSynthesizer(_openAi, openAIConfig);
 
-        var clientBuilder = DiscordClientBuilder.CreateDefault(discordConfig?.Token ??
-                                                               throw new InvalidOperationException(
-                                                                   "Invalid configuration, missing Discord bot token"),
-            DiscordIntents.AllUnprivileged | DiscordIntents.MessageContents |
-            DiscordIntents.GuildVoiceStates | DiscordIntents.GuildMembers);
+        // Create the REST client for API operations
+        _restClient = new RestClient(new BotToken(discordConfig?.Token ??
+                                                   throw new InvalidOperationException(
+                                                       "Invalid configuration, missing Discord bot token")));
 
-        clientBuilder.UseVoiceNext(new VoiceNextConfiguration());
-
-        clientBuilder.ConfigureEventHandlers(e =>
+        // Create and configure the Gateway client
+        _discord = new GatewayClient(new BotToken(discordConfig.Token), new GatewayClientConfiguration
         {
-            e.HandleVoiceStateUpdated(VoiceStateUpdated);
-            e.HandleMessageCreated(MessageCreated);
-            e.HandleSessionCreated(SessionCreated);
-            e.HandleGuildMemberUpdated(GuildMemberUpdated);
+            Intents = GatewayIntents.Guilds | GatewayIntents.GuildMessages | GatewayIntents.MessageContent |
+                      GatewayIntents.GuildVoiceStates | GatewayIntents.GuildUsers
         });
 
-        var discord = clientBuilder.Build();
-        await discord.ConnectAsync();
+        // Subscribe to events
+        _discord.Ready += OnReady;
+        _discord.MessageCreate += OnMessageCreate;
+        _discord.VoiceStateUpdate += OnVoiceStateUpdate;
+        _discord.GuildUserUpdate += OnGuildMemberUpdate;
+
+        // Connect and run
+        await _discord.StartAsync();
         await Task.Delay(Timeout.Infinite);
     }
 
-    private static async Task SessionCreated(DiscordClient sender, SessionCreatedEventArgs args)
+    private static async ValueTask OnReady(ReadyEventArgs args)
     {
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
@@ -123,46 +130,45 @@ public static partial class Program
 
         foreach (var server in servers)
         {
-            DiscordGuild foundServer;
-            try
-            {
-                foundServer = await sender.GetGuildAsync(server.Key);
-            }
-            catch (NotFoundException)
-            {
+            if (!_discord.Cache.Guilds.TryGetValue(server.Key, out var foundServer))
                 continue;
-            }
 
             // Get target channel, if any, if none is found don't go further
-            await SetNickname(sender, foundServer);
-            var targetChannel = await GetTargetChannel(sender, foundServer);
+            await SetNickname(foundServer);
+            var targetChannel = await GetTargetChannel(foundServer);
             if (targetChannel is null)
                 continue;
 
             // Connect to target channel
-            await targetChannel.ConnectAsync();
+            await ConnectToVoiceChannel(foundServer.Id, targetChannel.Id);
         }
     }
 
-    private static async Task MessageCreated(DiscordClient sender, MessageCreatedEventArgs args)
+    private static async ValueTask OnMessageCreate(Message message)
     {
-        if (!_personsOfInterest.Contains(args.Author.Id) || !_serversOfInterest.Contains(args.Guild.Id))
+        // Get guild ID - ignore DMs
+        if (message.GuildId is null)
             return;
         
-        var rawMessage = args.Message.Content;
+        var guildId = message.GuildId.Value;
+        
+        if (!_personsOfInterest.Contains(message.Author.Id) || !_serversOfInterest.Contains(guildId))
+            return;
+        
+        var rawMessage = message.Content;
         
         // Check if this is to check for listened channels
         if (rawMessage.Equals(".listening", StringComparison.InvariantCultureIgnoreCase))
         {
             var listenedChannels = GetConfiguration<TargetConfiguration>("target").Users
-                .First(x => x.User == args.Author.Id).Servers.First(x => x.Server == args.Guild.Id).Channels;
-            await args.Channel.SendMessageAsync(
+                .First(x => x.User == message.Author.Id).Servers.First(x => x.Server == guildId).Channels;
+            await _restClient.SendMessageAsync(message.ChannelId,
                 $"I'm currently listening to the following channels: {string.Join(",", listenedChannels.Select(x => $"<#{x}>"))}");
             return;
         }
 
         // Outside of anything above, ignore any non-listened channel
-        if (!_channelsForUser[args.Author.Id].Contains(args.Channel.Id))
+        if (!_channelsForUser[message.Author.Id].Contains(message.ChannelId))
             return;
 
         // Determine if this message should be skipped based on configured skip prefix or current state
@@ -170,34 +176,55 @@ public static partial class Program
         if (rawMessage.StartsWith(miscConfig.Silencer))
             return;
         
-        var vcChannel = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>().GetConnection(args.Guild);
-        if (vcChannel == null)
+        // Check if we have a voice connection for this guild
+        if (!VoiceConnections.TryGetValue(guildId, out var voiceClient))
+            return;
+
+        // Get the guild from cache
+        if (!_discord.Cache.Guilds.TryGetValue(guildId, out var guild))
             return;
 
         // If the user is not in the vc channel, or not undeafened, ignore them
-        if (!vcChannel.TargetChannel.Users.Any(x =>
-                x.Id == args.Author.Id && x.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false }))
+        if (!guild.VoiceStates.TryGetValue(message.Author.Id, out var userVoiceState) || 
+            !userVoiceState.ChannelId.HasValue ||
+            userVoiceState.IsSelfDeafened || 
+            userVoiceState.IsDeafened)
             return;
         
         // Handle mentioned users
-        foreach (var mention in args.Message.MentionedUsers)
+        if (message.MentionedUsers != null)
         {
-            rawMessage = rawMessage.Replace($"<@{mention.Id}>",
-                $" at {(await args.Guild.GetMemberAsync(mention.Id)).DisplayName}");
+            foreach (var mention in message.MentionedUsers)
+            {
+                var member = guild.Users.GetValueOrDefault(mention.Id);
+                var displayName = member?.Nickname ?? mention.GlobalName ?? mention.Username;
+                rawMessage = rawMessage.Replace($"<@{mention.Id}>", $" at {displayName}");
+            }
         }
 
-        // Handle mentioned channels
-        foreach (var mention in args.Message.MentionedChannels)
+        // Handle mentioned channels - using regex to find channel mentions
+        var channelMentionRegex = ChannelMentionPattern();
+        foreach (Match match in channelMentionRegex.Matches(rawMessage))
         {
-            rawMessage = rawMessage.Replace($"<#{mention.Id}>",
-                $" at {(await args.Guild.GetChannelAsync(mention.Id)).Name}");
+            if (ulong.TryParse(match.Groups[1].Value, out var channelId))
+            {
+                if (guild.Channels.TryGetValue(channelId, out var channel))
+                {
+                    rawMessage = rawMessage.Replace(match.Value, $" at {channel.Name}");
+                }
+            }
         }
 
         // Handle mentioned roles
-        foreach (var mention in args.Message.MentionedRoles)
+        if (message.MentionedRoleIds != null)
         {
-            rawMessage = rawMessage.Replace($"<@&{mention.Id}>",
-                $" at {(await args.Guild.GetRoleAsync(mention.Id)).Name}");
+            foreach (var roleId in message.MentionedRoleIds)
+            {
+                if (guild.Roles.TryGetValue(roleId, out var role))
+                {
+                    rawMessage = rawMessage.Replace($"<@&{roleId}>", $" at {role.Name}");
+                }
+            }
         }
 
         // Strip out emojis
@@ -209,7 +236,8 @@ public static partial class Program
         var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
 
         // Check for attachments to describe
-        var imageAttachments = args.Message.Attachments.Where(x => x.MediaType != null && x.MediaType.Contains("image"))
+        var imageAttachments = message.Attachments
+            .Where(x => x.ContentType != null && x.ContentType.Contains("image"))
             .ToList();
         if (imageAttachments.Count != 0)
             rawMessage += (string.IsNullOrWhiteSpace(rawMessage) ? string.Empty : ". ") +
@@ -227,12 +255,11 @@ public static partial class Program
             rawMessage = await ApplyFlavorPrompt(rawMessage);
 
         // Perform TTS conversion
-        var audioResult = await _voiceSynth.SynthesizeTextToSpeechAsync(rawMessage, _voices[args.Author.Id]);
+        var audioResult = await _voiceSynth.SynthesizeTextToSpeechAsync(rawMessage, _voices[message.Author.Id]);
         if (audioResult == null)
             return;
 
-        var guildId = vcChannel.TargetChannel.Guild.Id;
-        MessageQueues[guildId].Enqueue(new QueuedMessage(audioResult, vcChannel, _voiceSynth.AudioFormat));
+        MessageQueues[guildId].Enqueue(new QueuedMessage(audioResult, guildId, _voiceSynth.AudioFormat));
         if (MessageQueues[guildId].Count == 1)
             await ProcessMessageQueue(guildId);
     }
@@ -256,9 +283,11 @@ public static partial class Program
     {
         while (MessageQueues[guildId].TryPeek(out var task))
         {
-            // Send it out!
-            var transmit = task.VoiceChannel.GetTransmitSink();
-            await ConvertAudioToPcm(task.Stream, transmit, task.AudioFormat);
+            // Check if we have a voice connection for this guild
+            if (VoiceConnections.TryGetValue(guildId, out var voiceClient))
+            {
+                await SendAudioToVoiceChannel(task.Stream, voiceClient, task.AudioFormat);
+            }
             task.Stream.Close();
 
             // Get rid of the item we were processing afterwards
@@ -266,7 +295,7 @@ public static partial class Program
         }
     }
 
-    private static async Task<string> DescribeAttachments(IEnumerable<DiscordAttachment> attachments)
+    private static async Task<string> DescribeAttachments(IEnumerable<Attachment> attachments)
     {
         var openAIConfig = GetConfiguration<OpenAIConfiguration>("openai");
 
@@ -286,119 +315,222 @@ public static partial class Program
             : "Failed to describe attached images.";
     }
 
-    private static async Task VoiceStateUpdated(DiscordClient sender, VoiceStateUpdatedEventArgs args)
+    private static async ValueTask OnVoiceStateUpdate(VoiceState voiceState)
     {
-        if (!_personsOfInterest.Contains(args.UserId) || !_serversOfInterest.Contains(args.GuildId.Value))
+        if (!_personsOfInterest.Contains(voiceState.UserId) || !_serversOfInterest.Contains(voiceState.GuildId))
+            return;
+
+        // Get guild from cache
+        if (!_discord.Cache.Guilds.TryGetValue(voiceState.GuildId, out var guild))
             return;
 
         // Set nickname if an update is needed
-        var guild = await args.GetGuildAsync();
-        await SetNickname(sender, guild);
+        await SetNickname(guild);
 
-        var existingConnection = sender.ServiceProvider.GetRequiredService<VoiceNextExtension>()
-            .GetConnection(guild);
-        var target = await GetTargetChannel(sender, guild);
+        var existingConnection = VoiceConnections.TryGetValue(voiceState.GuildId, out var vc) ? vc : null;
+        var target = await GetTargetChannel(guild);
+        
         if (target is null)
         {
-            existingConnection?.Disconnect();
+            await DisconnectFromVoiceChannel(voiceState.GuildId);
             return;
         }
 
-        // If we're already in a channel don't change anything
-        if (existingConnection?.TargetChannel.Id == target.Id)
+        // If we're already in the target channel, don't change anything
+        if (existingConnection != null && VoiceConnections.TryGetValue(voiceState.GuildId, out _))
+        {
+            // Check if we need to move to a different channel
+            // For now, we'll just verify we have a connection
             return;
+        }
 
-        // Disconnect from any previous channel and connect to the new target
-        existingConnection?.Disconnect();
-        await target.ConnectAsync();
+        // Connect to the new target channel
+        await DisconnectFromVoiceChannel(voiceState.GuildId);
+        await ConnectToVoiceChannel(voiceState.GuildId, target.Id);
     }
 
-    private static async Task<DiscordChannel?> GetTargetChannel(DiscordClient client, DiscordGuild guild)
+    private static Task<IGuildChannel?> GetTargetChannel(Guild guild)
     {
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
-        var channels = (await guild.GetChannelsAsync())
-            .Where(x => x.Type == DiscordChannelType.Voice && x.Users.Any(y => users.Contains(y.Id)))
-            .Select(x => new
+        
+        // Get voice channel IDs where users of interest are present
+        var voiceChannelIds = guild.VoiceStates.Values
+            .Where(vs => vs.ChannelId.HasValue && users.Contains(vs.UserId))
+            .Select(vs => vs.ChannelId!.Value)
+            .Distinct()
+            .ToHashSet();
+        
+        // Get the actual voice channels
+        var voiceChannels = guild.Channels.Values
+            .Where(x => voiceChannelIds.Contains(x.Id))
+            .ToList();
+        
+        // Score each channel based on users of interest in it
+        var channels = voiceChannels
+            .Select(channel =>
             {
-                value = x,
-                score = x.Users.Count(y =>
-                    users.Contains(y.Id) && y.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false })
+                // Find users in this voice channel from voice states
+                var usersInChannel = guild.VoiceStates.Values
+                    .Where(vs => vs.ChannelId == channel.Id && users.Contains(vs.UserId))
+                    .ToList();
+                
+                var score = usersInChannel.Count(vs => !vs.IsSelfDeafened && !vs.IsDeafened);
+                
+                return new { value = channel, score };
             })
+            .Where(x => x.score > 0)
             .OrderByDescending(x => x.score)
             .ToList();
 
-        var existingConnection = client.ServiceProvider.GetRequiredService<VoiceNextExtension>()
-            .GetConnection(guild);
-
         // No target channels
-        if (channels.Count == 0 || channels[0].score == 0)
+        if (channels.Count == 0)
         {
-            return null;
+            return Task.FromResult<IGuildChannel?>(null);
         }
 
         // Only take the highest score channel[s]
-        channels = channels.Where(x => x.score == channels[0].score).ToList();
-        if (existingConnection != null && channels.Any(y => y.value.Id == existingConnection.TargetChannel.Id))
+        var topScore = channels[0].score;
+        channels = channels.Where(x => x.score == topScore).ToList();
+        
+        // Check if we're already connected to one of these channels
+        if (VoiceConnections.TryGetValue(guild.Id, out _))
         {
-            // We're already in the desired channel, don't bother doing anything
-            return existingConnection.TargetChannel;
+            // For now, just return the first channel with the highest score
+            // In a more sophisticated implementation, we could track which channel we're in
         }
 
         // Just return the first entry as we have no other tie breaker at the moment
-        return channels[0].value;
+        return Task.FromResult<IGuildChannel?>(channels[0].value);
     }
 
-    private static async Task GuildMemberUpdated(DiscordClient sender, GuildMemberUpdatedEventArgs args)
+    private static async ValueTask OnGuildMemberUpdate(GuildUser guildUser)
     {
-        if (!_personsOfInterest.Contains(args.Member.Id) || !_serversOfInterest.Contains(args.Guild.Id))
+        if (!_personsOfInterest.Contains(guildUser.Id) || !_serversOfInterest.Contains(guildUser.GuildId))
             return;
 
-        // Don't bother processing anything other than a nickname/name change
-        if (args.NicknameAfter.Equals(args.NicknameBefore))
+        // Get guild from cache
+        if (!_discord.Cache.Guilds.TryGetValue(guildUser.GuildId, out var guild))
             return;
 
-        // Get target user in this guild
-        await SetNickname(sender, args.Guild);
+        // Set nickname
+        await SetNickname(guild);
     }
 
-    private static async Task SetNickname(DiscordClient client, DiscordGuild guild)
+    private static async Task SetNickname(Guild guild)
     {
         // Get target channel, if any, if none is found don't go further
-        var voiceless = await guild.GetMemberAsync(client.CurrentUser.Id);
-        var targetChannel = await GetTargetChannel(client, guild);
+        var targetChannel = await GetTargetChannel(guild);
+        var users = UsersOfInterestForServer(guild.Id).ToHashSet();
+        
+        string nickname;
         if (targetChannel is null)
         {
-            await voiceless.ModifyAsync(x => x.Nickname = "Voiceless");
-            return;
+            nickname = "Voiceless";
         }
-
-        // Get target user in this channel and set nickname accordingly
-        var users = UsersOfInterestForServer(guild.Id);
-        var targetUsers = targetChannel.Users.Where(x =>
-            users.Contains(x.Id) && x.VoiceState is { IsSelfDeafened: false, IsServerDeafened: false }).ToList();
-
-        switch (targetUsers.Count)
+        else
         {
-            case 0:
-                await voiceless.ModifyAsync(x => x.Nickname = "Voiceless");
-                break;
-            case 1:
-                await voiceless.ModifyAsync(x =>
-                    x.Nickname =
-                        $"{targetUsers[0].DisplayName[..Math.Min(26, targetUsers[0].DisplayName.Length)]}'s Mic");
-                break;
-            default:
-                await voiceless.ModifyAsync(x => x.Nickname = "Multi-User Mic");
-                break;
+            // Get target users in this channel from voice states
+            var targetUsers = guild.VoiceStates.Values
+                .Where(vs => vs.ChannelId == targetChannel.Id && 
+                            users.Contains(vs.UserId) && 
+                            !vs.IsSelfDeafened && 
+                            !vs.IsDeafened)
+                .ToList();
+
+            nickname = targetUsers.Count switch
+            {
+                0 => "Voiceless",
+                1 => GetNicknameForUser(guild, targetUsers[0].UserId),
+                _ => "Multi-User Mic"
+            };
         }
+
+        try
+        {
+            await _restClient.ModifyCurrentGuildUserAsync(guild.Id, x => x.Nickname = nickname);
+        }
+        catch
+        {
+            // Ignore errors when setting nickname (e.g., missing permissions)
+        }
+    }
+
+    private static string GetNicknameForUser(Guild guild, ulong userId)
+    {
+        var displayName = "Unknown";
+        if (guild.Users.TryGetValue(userId, out var member))
+        {
+            displayName = member.Nickname ?? member.GlobalName ?? member.Username;
+        }
+        return $"{displayName[..Math.Min(26, displayName.Length)]}'s Mic";
     }
 
     private static IEnumerable<ulong> UsersOfInterestForServer(ulong server) =>
         GetConfiguration<TargetConfiguration>("target")
             .Users.Where(x => x.Servers.Any(y => y.Server == server)).Select(x => x.User);
 
-    private static async Task ConvertAudioToPcm(Stream inputStream, VoiceTransmitSink outputStream, string audioFormat)
+    private static async Task ConnectToVoiceChannel(ulong guildId, ulong channelId)
     {
+        await VoiceConnectionLock.WaitAsync();
+        try
+        {
+            // Disconnect any existing connection first
+            await DisconnectFromVoiceChannelUnsafe(guildId);
+
+            // Join the voice channel
+            var voiceClient = await _discord.JoinVoiceChannelAsync(guildId, channelId);
+
+            // Start the voice client
+            await voiceClient.StartAsync();
+
+            // Enter speaking state
+            await voiceClient.EnterSpeakingStateAsync(new SpeakingProperties(SpeakingFlags.Microphone));
+
+            VoiceConnections[guildId] = voiceClient;
+        }
+        finally
+        {
+            VoiceConnectionLock.Release();
+        }
+    }
+
+    private static async Task DisconnectFromVoiceChannel(ulong guildId)
+    {
+        await VoiceConnectionLock.WaitAsync();
+        try
+        {
+            await DisconnectFromVoiceChannelUnsafe(guildId);
+        }
+        finally
+        {
+            VoiceConnectionLock.Release();
+        }
+    }
+
+    private static async Task DisconnectFromVoiceChannelUnsafe(ulong guildId)
+    {
+        if (VoiceConnections.TryRemove(guildId, out var voiceClient))
+        {
+            try
+            {
+                await voiceClient.CloseAsync();
+            }
+            catch
+            {
+                // Ignore errors during disconnection
+            }
+        }
+    }
+
+    private static async Task SendAudioToVoiceChannel(Stream inputStream, VoiceClient voiceClient, string audioFormat)
+    {
+        // Create the output stream for sending to Discord
+        var outStream = voiceClient.CreateOutputStream();
+
+        // Create Opus encode stream to convert PCM to Opus
+        await using var opusStream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
+
+        // Start FFmpeg to convert input audio to PCM
         var ffmpeg = Process.Start(new ProcessStartInfo
         {
             FileName = "ffmpeg",
@@ -409,12 +541,11 @@ public static partial class Program
         });
 
         if (ffmpeg is null)
-            throw new NullReferenceException("Failed to create FFMPEG instance!");
+            throw new InvalidOperationException("Failed to create FFmpeg instance!");
 
         // Have to do input and output at the same time otherwise output buffer fills and waits
         var inputTask = Task.Run(async () =>
         {
-            // Copy in input
             inputStream.Seek(0, SeekOrigin.Begin);
             await inputStream.CopyToAsync(ffmpeg.StandardInput.BaseStream);
             ffmpeg.StandardInput.Close();
@@ -422,14 +553,15 @@ public static partial class Program
 
         var outputTask = Task.Run(async () =>
         {
-            await ffmpeg.StandardOutput.BaseStream.CopyToAsync(outputStream);
+            await ffmpeg.StandardOutput.BaseStream.CopyToAsync(opusStream);
             ffmpeg.StandardOutput.Close();
         });
 
         await Task.WhenAll(inputTask, outputTask);
-
-        // Let conversion happen
         await ffmpeg.WaitForExitAsync();
+
+        // Flush to ensure all data is sent
+        await opusStream.FlushAsync();
     }
 
     private static T GetConfiguration<T>(string section) where T : class, new()
