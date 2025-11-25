@@ -51,7 +51,7 @@ public static partial class Program
     {
         // Configure Serilog - use Information level by default for reasonable output
         Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Information()
+            .MinimumLevel.Debug()
             .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
             .CreateLogger();
 
@@ -168,12 +168,13 @@ public static partial class Program
 
         foreach (var server in servers)
         {
+            var restGuild = await _discord.Rest.GetGuildAsync(server.Key);
             if (!_discord.Cache.Guilds.TryGetValue(server.Key, out var foundServer))
             {
                 Log.Warning("Server {ServerId} not found in cache", server.Key);
                 continue;
             }
-
+            
             Log.Debug("Processing server: {ServerName} ({ServerId})", foundServer.Name, foundServer.Id);
             Log.Debug("Voice states in server: {VoiceStateCount}", foundServer.VoiceStates.Count);
             
