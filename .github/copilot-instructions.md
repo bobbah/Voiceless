@@ -37,7 +37,7 @@ dotnet publish Voiceless -o publish/win-x64/Voiceless/ -r "win-x64" --self-conta
 ```
 
 ### Build Notes
-- The build produces nullable reference warnings (CS8618, CS8629, CS8604). These are expected and do not cause build failure.
+- The build produces nullable warnings (CS8618 for non-nullable properties, CS8629 for nullable value types, CS8604 for possible null reference arguments). These are expected and do not cause build failure.
 - One deprecation warning (CS0618) exists in `ElevenLabsVoiceSynthesizer.cs` - this is known and non-blocking.
 - Build time is typically under 10 seconds.
 
