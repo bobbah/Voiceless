@@ -710,10 +710,39 @@ public static partial class Program
         var outStream = voiceClient.CreateOutputStream();
         Log.Debug("SendAudioToVoiceChannel: Discord output stream created, type: {Type}", outStream.GetType().Name);
 
-        // Create Opus encode stream to convert PCM to Opus (matching NetCord example - not using await using)
-        Log.Debug("SendAudioToVoiceChannel: Creating Opus encode stream...");
-        var opusStream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
-        Log.Debug("SendAudioToVoiceChannel: Opus encode stream created");
+        // Create Opus encode stream to convert PCM to Opus
+        // Run this on a background thread with a timeout in case it blocks
+        Log.Debug("SendAudioToVoiceChannel: Creating Opus encode stream (with timeout protection)...");
+        OpusEncodeStream? opusStream = null;
+        try
+        {
+            var createOpusTask = Task.Run(() =>
+            {
+                Log.Debug("SendAudioToVoiceChannel: Inside Task.Run creating OpusEncodeStream...");
+                var stream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
+                Log.Debug("SendAudioToVoiceChannel: OpusEncodeStream constructor completed");
+                return stream;
+            });
+            
+            // Wait with a timeout
+            if (await Task.WhenAny(createOpusTask, Task.Delay(TimeSpan.FromSeconds(10))).ConfigureAwait(false) == createOpusTask)
+            {
+                opusStream = await createOpusTask.ConfigureAwait(false);
+                Log.Debug("SendAudioToVoiceChannel: Opus encode stream created successfully");
+            }
+            else
+            {
+                Log.Error("SendAudioToVoiceChannel: OpusEncodeStream creation timed out after 10 seconds!");
+                ffmpeg.Kill();
+                throw new TimeoutException("OpusEncodeStream creation timed out");
+            }
+        }
+        catch (Exception ex) when (ex is not TimeoutException)
+        {
+            Log.Error(ex, "SendAudioToVoiceChannel: Error creating OpusEncodeStream");
+            ffmpeg.Kill();
+            throw;
+        }
 
         try
         {
@@ -824,14 +853,17 @@ public static partial class Program
         }
         finally
         {
-            // Dispose the opus stream
-            try
+            // Dispose the opus stream if it was created
+            if (opusStream != null)
             {
-                await opusStream.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception disposeEx)
-            {
-                Log.Debug(disposeEx, "SendAudioToVoiceChannel: Error disposing opus stream");
+                try
+                {
+                    await opusStream.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception disposeEx)
+                {
+                    Log.Debug(disposeEx, "SendAudioToVoiceChannel: Error disposing opus stream");
+                }
             }
         }
     }
