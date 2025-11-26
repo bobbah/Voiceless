@@ -667,17 +667,7 @@ public static partial class Program
         Log.Debug("SendAudioToVoiceChannel: Starting audio transmission, format: {Format}, input stream length: {Length}", 
             audioFormat, streamLength);
         
-        // Create the output stream for sending to Discord
-        Log.Debug("SendAudioToVoiceChannel: Creating Discord output stream...");
-        var outStream = voiceClient.CreateOutputStream();
-        Log.Debug("SendAudioToVoiceChannel: Discord output stream created");
-
-        // Create Opus encode stream to convert PCM to Opus
-        Log.Debug("SendAudioToVoiceChannel: Creating Opus encode stream...");
-        await using var opusStream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
-        Log.Debug("SendAudioToVoiceChannel: Opus encode stream created");
-
-        // Start FFmpeg to convert input audio to PCM
+        // Start FFmpeg to convert input audio to PCM - do this FIRST before creating streams
         Log.Debug("SendAudioToVoiceChannel: Creating FFmpeg process start info...");
         var startInfo = new ProcessStartInfo
         {
@@ -714,6 +704,16 @@ public static partial class Program
         }
 
         Log.Debug("SendAudioToVoiceChannel: FFmpeg process started (PID: {Pid})", ffmpeg.Id);
+        
+        // Create the output stream for sending to Discord
+        Log.Debug("SendAudioToVoiceChannel: Creating Discord output stream...");
+        var outStream = voiceClient.CreateOutputStream();
+        Log.Debug("SendAudioToVoiceChannel: Discord output stream created, type: {Type}", outStream.GetType().Name);
+
+        // Create Opus encode stream to convert PCM to Opus (matching NetCord example - not using await using)
+        Log.Debug("SendAudioToVoiceChannel: Creating Opus encode stream...");
+        var opusStream = new OpusEncodeStream(outStream, PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
+        Log.Debug("SendAudioToVoiceChannel: Opus encode stream created");
 
         try
         {
@@ -821,6 +821,18 @@ public static partial class Program
             }
             
             throw;
+        }
+        finally
+        {
+            // Dispose the opus stream
+            try
+            {
+                await opusStream.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception disposeEx)
+            {
+                Log.Debug(disposeEx, "SendAudioToVoiceChannel: Error disposing opus stream");
+            }
         }
     }
 
