@@ -1,0 +1,9 @@
+<Project>
+    <PropertyGroup>
+        <Authors>Brett Williams</Authors>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="MinVer" Version="6.0.0" PrivateAssets="All" />
+    </ItemGroup>
+</Project>

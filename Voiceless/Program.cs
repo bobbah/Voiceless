@@ -57,7 +57,8 @@ public static partial class Program
 
         try
         {
-            Log.Information("Voiceless starting up...");
+            var version = GetVersionInfo();
+            Log.Information("Voiceless {Version} starting up...", version);
 
             // Get config
             var builder = new ConfigurationBuilder()
@@ -874,5 +875,14 @@ public static partial class Program
         var options = new ConfigureOptions<T>(o => _configuration.GetSection(section).Bind(o));
         options.Configure(toReturn);
         return toReturn;
+    }
+
+    private static string GetVersionInfo()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                      ?? assembly.GetName().Version?.ToString()
+                      ?? "Unknown";
+        return version;
     }
 }
