@@ -19,7 +19,7 @@ public class ElevenLabsVoiceSynthesizer(ElevenLabsConfiguration config) : IVoice
             Log.Debug("ElevenLabs: Configuring client...");
             _voice = await GetConfiguredVoiceAsync();
             _model = await GetModelAsync();
-            Log.Information("ElevenLabs: Client configured successfully with voice '{VoiceId}' and model '{ModelId}'", 
+            Log.Information("ElevenLabs: Client configured successfully with voice '{VoiceID}' and model '{ModelID}'", 
                 _voice.Id, _model.Id);
         }
         catch (Exception ex)
@@ -57,11 +57,11 @@ public class ElevenLabsVoiceSynthesizer(ElevenLabsConfiguration config) : IVoice
 
     private async Task<ElevenLabs.Voices.Voice> GetConfiguredVoiceAsync()
     {
-        Log.Debug("ElevenLabs: Getting voice with ID '{VoiceId}'", config.VoiceID);
+        Log.Debug("ElevenLabs: Getting voice with ID '{VoiceID}'", config.VoiceID);
         var voice = await _client.VoicesEndpoint.GetVoiceAsync(config.VoiceID);
         if (voice == null)
         {
-            Log.Error("ElevenLabs: Failed to get voice with configured ID '{VoiceId}'", config.VoiceID);
+            Log.Error("ElevenLabs: Failed to get voice with configured ID '{VoiceID}'", config.VoiceID);
             throw new Exception($"Failed to get ElevenLabs Voice with configured id ('{config.VoiceID}')");
         }
         Log.Debug("ElevenLabs: Successfully retrieved voice '{VoiceName}'", voice.Name);
