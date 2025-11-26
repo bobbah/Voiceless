@@ -4,7 +4,7 @@
 
 **Voiceless** is a C# Discord bot that provides text-to-speech (TTS) functionality for Discord voice channels. It monitors text messages from specific users in configured channels and converts them to speech using either OpenAI or ElevenLabs APIs, then plays the audio in voice channels. The bot uses DSharpPlus for Discord integration and requires FFmpeg for audio processing.
 
-- **Language**: C# 13 with .NET 9.0
+- **Language**: C# 13 with .NET 10.0
 - **Type**: Console application (Discord bot)
 - **Size**: Small (~12 source files)
 - **External Dependencies**: OpenAI API, ElevenLabs API (optional), Discord Bot Token, FFmpeg (runtime)
@@ -12,7 +12,7 @@
 ## Build Instructions
 
 ### Prerequisites
-- .NET 9.0 SDK or later
+- .NET 10.0 SDK or later
 - FFmpeg (required at runtime for audio conversion)
 
 ### Build Commands
@@ -82,19 +82,12 @@ Voiceless/
 | `Voiceless/appsettings.json` | Configuration file for API tokens and settings |
 | `.github/workflows/release.yml` | GitHub Actions workflow for releases |
 
-## Dependencies (NuGet Packages)
-
-- `DSharpPlus.VoiceNext` (5.0.0-nightly-02560) - Discord voice support
-- `ElevenLabs-DotNet` (3.7.0) - ElevenLabs TTS API
-- `OpenAI` (2.7.0) - OpenAI TTS API
-- `Microsoft.Extensions.Configuration.*` (10.0.0) - Configuration binding
-
 ## CI/CD Pipeline
 
 The `release.yml` workflow runs **only on tag pushes** (not on regular commits):
 - Builds and publishes for `linux-x64` and `win-x64`
 - Creates a GitHub release with the artifacts
-- Uses .NET 9.0.x and runs on `ubuntu-22.04`
+- Uses .NET 10.0.x and runs on `ubuntu-22.04`
 
 **There is no CI workflow for pull requests.** Changes are validated locally.
 
