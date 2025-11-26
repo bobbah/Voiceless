@@ -4,7 +4,7 @@ A Discord bot that provides text-to-speech (TTS) functionality for Discord voice
 
 ## Prerequisites
 
-- .NET 9.0 SDK or later
+- .NET 10.0 SDK or later
 - FFmpeg (required at runtime for audio conversion)
 - Opus native library (required for voice encoding)
 - Discord Bot Token
