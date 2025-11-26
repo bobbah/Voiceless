@@ -50,9 +50,10 @@ This project currently has no test projects or test infrastructure. `dotnet test
 Voiceless/
 ├── .github/
 │   └── workflows/
-│       └── release.yml          # CI: Builds and publishes releases on tags
-├── Voiceless/                   # Main project directory
-│   ├── Configuration/           # Configuration POCO classes
+│       ├── ci.yml                # CI: Builds and tests on push/PR
+│       └── release.yml           # CI: Builds and publishes releases on tags
+├── Voiceless/                    # Main project directory
+│   ├── Configuration/            # Configuration POCO classes
 │   │   ├── DiscordConfiguration.cs
 │   │   ├── ElevenLabsConfiguration.cs
 │   │   ├── MiscConfiguration.cs
@@ -61,16 +62,18 @@ Voiceless/
 │   │   ├── TargetServer.cs
 │   │   └── TargetUser.cs
 │   ├── Data/
-│   │   └── QueuedMessage.cs     # Message queue record
-│   ├── Voice/                   # TTS synthesizer implementations
-│   │   ├── IVoiceSynthesizer.cs # Interface for TTS providers
+│   │   └── QueuedMessage.cs      # Message queue record
+│   ├── Voice/                    # TTS synthesizer implementations
+│   │   ├── IVoiceSynthesizer.cs  # Interface for TTS providers
 │   │   ├── ElevenLabsVoiceSynthesizer.cs
 │   │   └── OpenAIVoiceSynthesizer.cs
-│   ├── Program.cs               # Main entry point and Discord event handlers
-│   ├── Voiceless.csproj         # Project file (net9.0)
-│   └── appsettings.json         # Configuration template
-├── Voiceless.sln                # Solution file
-└── .gitignore                   # Standard Visual Studio gitignore
+│   ├── Program.cs                # Main entry point and Discord event handlers
+│   ├── Voiceless.csproj          # Project file (net10.0)
+│   └── appsettings.json          # Configuration template
+├── Directory.Build.props         # Shared build properties (MinVer, Authors)
+├── Directory.Build.targets       # Build targets for MinVer version metadata
+├── Voiceless.sln                 # Solution file
+└── .gitignore                    # Standard Visual Studio gitignore
 ```
 
 ## Key Files
@@ -80,6 +83,8 @@ Voiceless/
 | `Voiceless/Program.cs` | Main entry point, Discord client setup, event handlers |
 | `Voiceless/Voiceless.csproj` | Project file with dependencies and target framework |
 | `Voiceless/appsettings.json` | Configuration file for API tokens and settings |
+| `Directory.Build.props` | Shared build properties including MinVer package reference |
+| `Directory.Build.targets` | Build targets for MinVer version metadata |
 | `.github/workflows/release.yml` | GitHub Actions workflow for releases |
 
 ## CI/CD Pipeline
@@ -89,7 +94,15 @@ The `release.yml` workflow runs **only on tag pushes** (not on regular commits):
 - Creates a GitHub release with the artifacts
 - Uses .NET 10.0.x and runs on `ubuntu-22.04`
 
-**There is no CI workflow for pull requests.** Changes are validated locally.
+The `ci.yml` workflow runs on pushes to master and pull requests.
+
+## Versioning
+
+This project uses [MinVer](https://github.com/adamralph/minver) for automatic versioning based on Git tags:
+- Versions are calculated from the most recent semver tag (e.g., `v1.0.0`)
+- The version is displayed at startup in the console logs
+- Pre-release versions include the commit height from the last tag
+- PR builds use a special version format: `{major}.{minor}.{patch}-pr.{pr_number}.{prerelease}`
 
 ## Configuration
 

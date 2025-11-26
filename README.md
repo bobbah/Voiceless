@@ -116,6 +116,14 @@ dotnet build
 dotnet build -c Release
 ```
 
+## Versioning
+
+This project uses [MinVer](https://github.com/adamralph/minver) for automatic versioning based on Git tags. Versions are calculated automatically from the most recent semver tag (e.g., `v1.0.0`).
+
+- To create a new release, push a Git tag following semantic versioning (e.g., `v1.2.3`)
+- The version is displayed at startup in the console logs
+- Pre-release versions include the commit height from the last tag
+
 ## Configuration
 
 Copy `appsettings.json` to your output directory and configure:
