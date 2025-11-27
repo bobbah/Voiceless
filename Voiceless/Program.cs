@@ -159,11 +159,18 @@ public static partial class Program
         
         // Set bot presence with version
         var displayVersion = GetDisplayVersion();
-        await _discord.UpdatePresenceAsync(new PresenceProperties(UserStatusType.Online)
+        try
         {
-            Activities = [new UserActivityProperties($"v{displayVersion}", UserActivityType.Playing)]
-        });
-        Log.Information("Set bot presence to version: v{Version}", displayVersion);
+            await _discord.UpdatePresenceAsync(new PresenceProperties(UserStatusType.Online)
+            {
+                Activities = [new UserActivityProperties($"v{displayVersion}", UserActivityType.Playing)]
+            });
+            Log.Information("Set bot presence to version: v{Version}", displayVersion);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to set bot presence to version: v{Version}", displayVersion);
+        }
         
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
@@ -979,6 +986,9 @@ public static partial class Program
     private static string GetDisplayVersion()
     {
         var version = GetVersionInfo();
+        if (string.IsNullOrEmpty(version))
+            return "Unknown";
+        
         // Trim the commit hash suffix (everything after '+')
         var plusIndex = version.IndexOf('+');
         return plusIndex >= 0 ? version[..plusIndex] : version;
