@@ -459,16 +459,7 @@ public static partial class Program
     private static Task<IGuildChannel?> GetTargetChannel(Guild guild, VoiceState? overrideVoiceState = null)
     {
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
-        
-        // Build effective voice states by starting with cached states
-        // and applying the override if provided (to handle cache not being updated yet)
-        var effectiveVoiceStates = guild.VoiceStates.Values.ToList();
-        if (overrideVoiceState != null)
-        {
-            // Remove any cached state for this user and use the override instead
-            effectiveVoiceStates.RemoveAll(vs => vs.UserId == overrideVoiceState.UserId);
-            effectiveVoiceStates.Add(overrideVoiceState);
-        }
+        var effectiveVoiceStates = BuildEffectiveVoiceStates(guild, overrideVoiceState);
         
         // Get voice channel IDs where users of interest are present
         var voiceChannelIds = effectiveVoiceStates
@@ -541,15 +532,7 @@ public static partial class Program
         // Get target channel, if any, if none is found don't go further
         var targetChannel = await GetTargetChannel(guild, overrideVoiceState);
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
-        
-        // Build effective voice states by starting with cached states
-        // and applying the override if provided
-        var effectiveVoiceStates = guild.VoiceStates.Values.ToList();
-        if (overrideVoiceState != null)
-        {
-            effectiveVoiceStates.RemoveAll(vs => vs.UserId == overrideVoiceState.UserId);
-            effectiveVoiceStates.Add(overrideVoiceState);
-        }
+        var effectiveVoiceStates = BuildEffectiveVoiceStates(guild, overrideVoiceState);
         
         string nickname;
         if (targetChannel is null)
@@ -604,6 +587,29 @@ public static partial class Program
     private static IEnumerable<ulong> UsersOfInterestForServer(ulong server) =>
         GetConfiguration<TargetConfiguration>("target")
             .Users.Where(x => x.Servers.Any(y => y.Server == server)).Select(x => x.User);
+
+    /// <summary>
+    /// Builds a list of effective voice states by combining cached states with an optional override.
+    /// This ensures we use the most current state when processing voice state updates.
+    /// </summary>
+    private static List<VoiceState> BuildEffectiveVoiceStates(Guild guild, VoiceState? overrideVoiceState)
+    {
+        var effectiveVoiceStates = guild.VoiceStates.Values.ToList();
+        if (overrideVoiceState != null)
+        {
+            // Remove any cached state for this user and use the override instead
+            // This handles the case where the cache hasn't been updated yet when the event fires
+            effectiveVoiceStates.RemoveAll(vs => vs.UserId == overrideVoiceState.UserId);
+            
+            // Only add the override state if the user is still in a voice channel
+            // (ChannelId will be null when the user disconnects)
+            if (overrideVoiceState.ChannelId.HasValue)
+            {
+                effectiveVoiceStates.Add(overrideVoiceState);
+            }
+        }
+        return effectiveVoiceStates;
+    }
 
     private static async Task ConnectToVoiceChannel(ulong guildId, ulong channelId)
     {
