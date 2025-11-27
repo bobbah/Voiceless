@@ -31,11 +31,15 @@ public class ElevenLabsVoiceSynthesizer(ElevenLabsConfiguration config) : IVoice
 
     public string AudioFormat => "mp3";
 
-    public async Task<Stream?> SynthesizeTextToSpeechAsync(string text, string voice)
+    public async Task<Stream?> SynthesizeTextToSpeechAsync(string text, string voice, string? instructions = null)
     {
         try
         {
             Log.Debug("ElevenLabs: Synthesizing TTS for text of length {Length}", text.Length);
+            if (instructions != null)
+            {
+                Log.Debug("ElevenLabs: Instructions '{Instructions}' provided but not supported by ElevenLabs, ignoring", instructions);
+            }
             var result = await _client.TextToSpeechEndpoint.TextToSpeechAsync(text, _voice, model: _model, voiceSettings: new VoiceSettings(config.Stability, config.Similarity));
             if (result == null)
             {
