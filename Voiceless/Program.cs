@@ -725,6 +725,18 @@ public static partial class Program
                 Log.Warning(ex, "DisconnectFromVoiceChannelUnsafe: Error closing voice client for guild {GuildId}", guildId);
             }
         }
+        
+        // Send a voice state update to Discord to properly leave the voice channel
+        // Passing null for the channel ID signals that we want to disconnect
+        try
+        {
+            await _discord.UpdateVoiceStateAsync(new VoiceStateProperties(guildId, null));
+            Log.Debug("DisconnectFromVoiceChannelUnsafe: Sent voice state update to leave channel in guild {GuildId}", guildId);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "DisconnectFromVoiceChannelUnsafe: Error sending voice state update for guild {GuildId}", guildId);
+        }
     }
 
     private static async Task SendAudioToVoiceChannel(Stream inputStream, VoiceClient voiceClient, string audioFormat)
