@@ -46,6 +46,13 @@ public static partial class Program
     private static HashSet<ulong> _serversOfInterest = [];
     private static ConcurrentDictionary<ulong, string> _voices = [];
     private static ConcurrentDictionary<ulong, HashSet<ulong>> _channelsForUser = [];
+    
+    // Track voice states of target users ourselves instead of relying on gateway cache
+    // Key: (guildId, userId), Value: voice state info
+    private static readonly ConcurrentDictionary<(ulong GuildId, ulong UserId), TrackedVoiceState> TrackedVoiceStates = new();
+    
+    // Simple record to track the voice state info we care about
+    private record TrackedVoiceState(ulong? ChannelId, bool IsSelfDeafened, bool IsDeafened);
 
     public static async Task Main()
     {
@@ -179,9 +186,22 @@ public static partial class Program
             Log.Debug("Processing server: {ServerName} ({ServerId})", foundServer.Name, foundServer.Id);
             Log.Debug("Voice states in server: {VoiceStateCount}", foundServer.VoiceStates.Count);
             
+            // Initialize our internal voice state tracking from the initial cache
+            // This is only done once at startup; subsequent updates come from VoiceStateUpdate events
             foreach (var vs in foundServer.VoiceStates)
             {
                 Log.Debug("  Voice state - User: {UserId}, Channel: {ChannelId}", vs.Key, vs.Value.ChannelId);
+                
+                // Only track target users
+                if (_personsOfInterest.Contains(vs.Key) && vs.Value.ChannelId.HasValue)
+                {
+                    var key = (foundServer.Id, vs.Key);
+                    TrackedVoiceStates[key] = new TrackedVoiceState(
+                        vs.Value.ChannelId.Value,
+                        vs.Value.IsSelfDeafened,
+                        vs.Value.IsDeafened);
+                    Log.Debug("  Initialized tracking for user {UserId} in channel {ChannelId}", vs.Key, vs.Value.ChannelId.Value);
+                }
             }
 
             // Get target channel, if any, if none is found don't go further
@@ -257,10 +277,12 @@ public static partial class Program
         }
 
         // If the user is not in the vc channel, or not undeafened, ignore them
-        if (!guild.VoiceStates.TryGetValue(message.Author.Id, out var userVoiceState) || 
-            !userVoiceState.ChannelId.HasValue ||
-            userVoiceState.IsSelfDeafened || 
-            userVoiceState.IsDeafened)
+        // Use our internal tracked voice states instead of the gateway cache
+        var userVoiceStateKey = (guildId, message.Author.Id);
+        if (!TrackedVoiceStates.TryGetValue(userVoiceStateKey, out var trackedUserState) ||
+            !trackedUserState.ChannelId.HasValue ||
+            trackedUserState.IsSelfDeafened || 
+            trackedUserState.IsDeafened)
         {
             Log.Debug("OnMessageCreate: User {UserId} not in voice or is deafened", message.Author.Id);
             return;
@@ -412,13 +434,17 @@ public static partial class Program
         Log.Debug("VoiceStateUpdate: User {UserId} in Guild {GuildId}, Channel: {ChannelId}", 
             voiceState.UserId, voiceState.GuildId, voiceState.ChannelId);
         
+        // Only track target users in monitored servers
         if (!_personsOfInterest.Contains(voiceState.UserId) || !_serversOfInterest.Contains(voiceState.GuildId))
         {
             Log.Debug("VoiceStateUpdate: User {UserId} not a person of interest or server not monitored", voiceState.UserId);
             return;
         }
+        
+        // Update our internal voice state tracking immediately from the event
+        UpdateTrackedVoiceState(voiceState);
 
-        // Get guild from cache
+        // Get guild from cache (only needed for channel names and nickname setting, not voice state)
         if (!_discord.Cache.Guilds.TryGetValue(voiceState.GuildId, out var guild))
         {
             Log.Warning("VoiceStateUpdate: Guild {GuildId} not found in cache", voiceState.GuildId);
@@ -428,10 +454,10 @@ public static partial class Program
         Log.Debug("VoiceStateUpdate: Processing for guild {GuildName}", guild.Name);
         
         // Set nickname if an update is needed
-        await SetNickname(guild, voiceState);
+        await SetNickname(guild);
 
-        // Pass the incoming voice state to ensure we use the most current state for this user
-        var target = await GetTargetChannel(guild, voiceState);
+        // Get target channel using our internal tracking (no longer passing override since we track it ourselves)
+        var target = await GetTargetChannel(guild);
         
         if (target is null)
         {
@@ -455,16 +481,48 @@ public static partial class Program
         // Connect to the new target channel (this will disconnect from current channel first)
         await ConnectToVoiceChannel(voiceState.GuildId, target.Id);
     }
+    
+    /// <summary>
+    /// Updates our internal tracking of voice states from incoming VoiceStateUpdate events.
+    /// This allows us to avoid relying on the gateway cache which may be stale.
+    /// </summary>
+    private static void UpdateTrackedVoiceState(VoiceState voiceState)
+    {
+        var key = (voiceState.GuildId, voiceState.UserId);
+        
+        if (voiceState.ChannelId.HasValue)
+        {
+            // User is in a voice channel - update or add their state
+            TrackedVoiceStates[key] = new TrackedVoiceState(
+                voiceState.ChannelId.Value,
+                voiceState.IsSelfDeafened,
+                voiceState.IsDeafened);
+            Log.Debug("UpdateTrackedVoiceState: Updated state for user {UserId} in guild {GuildId}: Channel={ChannelId}, SelfDeaf={SelfDeaf}, Deaf={Deaf}",
+                voiceState.UserId, voiceState.GuildId, voiceState.ChannelId.Value, voiceState.IsSelfDeafened, voiceState.IsDeafened);
+        }
+        else
+        {
+            // User disconnected from voice - remove their state
+            TrackedVoiceStates.TryRemove(key, out _);
+            Log.Debug("UpdateTrackedVoiceState: Removed state for user {UserId} in guild {GuildId} (disconnected)",
+                voiceState.UserId, voiceState.GuildId);
+        }
+    }
 
-    private static Task<IGuildChannel?> GetTargetChannel(Guild guild, VoiceState? overrideVoiceState = null)
+    private static Task<IGuildChannel?> GetTargetChannel(Guild guild)
     {
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
-        var effectiveVoiceStates = BuildEffectiveVoiceStates(guild, overrideVoiceState);
+        
+        // Use our internal tracked voice states instead of the gateway cache
+        var trackedStates = TrackedVoiceStates
+            .Where(kvp => kvp.Key.GuildId == guild.Id && users.Contains(kvp.Key.UserId))
+            .Select(kvp => new { UserId = kvp.Key.UserId, State = kvp.Value })
+            .ToList();
         
         // Get voice channel IDs where users of interest are present
-        var voiceChannelIds = effectiveVoiceStates
-            .Where(vs => vs.ChannelId.HasValue && users.Contains(vs.UserId))
-            .Select(vs => vs.ChannelId!.Value)
+        var voiceChannelIds = trackedStates
+            .Where(ts => ts.State.ChannelId.HasValue)
+            .Select(ts => ts.State.ChannelId!.Value)
             .Distinct()
             .ToHashSet();
         
@@ -477,12 +535,12 @@ public static partial class Program
         var channels = voiceChannels
             .Select(channel =>
             {
-                // Find users in this voice channel from voice states
-                var usersInChannel = effectiveVoiceStates
-                    .Where(vs => vs.ChannelId == channel.Id && users.Contains(vs.UserId))
+                // Find users in this voice channel from our tracked states
+                var usersInChannel = trackedStates
+                    .Where(ts => ts.State.ChannelId == channel.Id)
                     .ToList();
                 
-                var score = usersInChannel.Count(vs => !vs.IsSelfDeafened && !vs.IsDeafened);
+                var score = usersInChannel.Count(ts => !ts.State.IsSelfDeafened && !ts.State.IsDeafened);
                 
                 return new { value = channel, score };
             })
@@ -527,12 +585,17 @@ public static partial class Program
         await SetNickname(guild);
     }
 
-    private static async Task SetNickname(Guild guild, VoiceState? overrideVoiceState = null)
+    private static async Task SetNickname(Guild guild)
     {
         // Get target channel, if any, if none is found don't go further
-        var targetChannel = await GetTargetChannel(guild, overrideVoiceState);
+        var targetChannel = await GetTargetChannel(guild);
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
-        var effectiveVoiceStates = BuildEffectiveVoiceStates(guild, overrideVoiceState);
+        
+        // Use our internal tracked voice states instead of the gateway cache
+        var trackedStates = TrackedVoiceStates
+            .Where(kvp => kvp.Key.GuildId == guild.Id && users.Contains(kvp.Key.UserId))
+            .Select(kvp => new { UserId = kvp.Key.UserId, State = kvp.Value })
+            .ToList();
         
         string nickname;
         if (targetChannel is null)
@@ -542,12 +605,11 @@ public static partial class Program
         }
         else
         {
-            // Get target users in this channel from voice states
-            var targetUsers = effectiveVoiceStates
-                .Where(vs => vs.ChannelId == targetChannel.Id && 
-                            users.Contains(vs.UserId) && 
-                            !vs.IsSelfDeafened && 
-                            !vs.IsDeafened)
+            // Get target users in this channel from our tracked voice states
+            var targetUsers = trackedStates
+                .Where(ts => ts.State.ChannelId == targetChannel.Id && 
+                            !ts.State.IsSelfDeafened && 
+                            !ts.State.IsDeafened)
                 .ToList();
 
             Log.Debug("SetNickname: Found {UserCount} undeafened target users in channel {ChannelName}", 
@@ -587,29 +649,6 @@ public static partial class Program
     private static IEnumerable<ulong> UsersOfInterestForServer(ulong server) =>
         GetConfiguration<TargetConfiguration>("target")
             .Users.Where(x => x.Servers.Any(y => y.Server == server)).Select(x => x.User);
-
-    /// <summary>
-    /// Builds a list of effective voice states by combining cached states with an optional override.
-    /// This ensures we use the most current state when processing voice state updates.
-    /// </summary>
-    private static List<VoiceState> BuildEffectiveVoiceStates(Guild guild, VoiceState? overrideVoiceState)
-    {
-        var effectiveVoiceStates = guild.VoiceStates.Values.ToList();
-        if (overrideVoiceState != null)
-        {
-            // Remove any cached state for this user and use the override instead
-            // This handles the case where the cache hasn't been updated yet when the event fires
-            effectiveVoiceStates.RemoveAll(vs => vs.UserId == overrideVoiceState.UserId);
-            
-            // Only add the override state if the user is still in a voice channel
-            // (ChannelId will be null when the user disconnects)
-            if (overrideVoiceState.ChannelId.HasValue)
-            {
-                effectiveVoiceStates.Add(overrideVoiceState);
-            }
-        }
-        return effectiveVoiceStates;
-    }
 
     private static async Task ConnectToVoiceChannel(ulong guildId, ulong channelId)
     {
