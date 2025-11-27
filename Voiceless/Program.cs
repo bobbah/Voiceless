@@ -353,9 +353,21 @@ public static partial class Program
         if (flavorPrompt != string.Empty)
             rawMessage = await ApplyFlavorPrompt(rawMessage);
 
+        // Extract voice instructions from the message if present (e.g., %sensually%)
+        var (cleanedMessage, instructions) = InstructionParser.ExtractInstructions(rawMessage);
+        rawMessage = cleanedMessage;
+        if (instructions != null)
+        {
+            Log.Debug("OnMessageCreate: Extracted instructions '{Instructions}' from message", instructions);
+        }
+
+        // Abort here if the message is now empty after extracting instructions
+        if (string.IsNullOrWhiteSpace(rawMessage))
+            return;
+
         // Perform TTS conversion
         Log.Debug("OnMessageCreate: Synthesizing TTS for message");
-        var audioResult = await _voiceSynth.SynthesizeTextToSpeechAsync(rawMessage, _voices[message.Author.Id]);
+        var audioResult = await _voiceSynth.SynthesizeTextToSpeechAsync(rawMessage, _voices[message.Author.Id], instructions);
         if (audioResult == null)
         {
             Log.Warning("OnMessageCreate: TTS synthesis returned null");
