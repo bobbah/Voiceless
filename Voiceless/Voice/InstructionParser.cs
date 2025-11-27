@@ -8,7 +8,11 @@ namespace Voiceless.Voice;
 /// </summary>
 public static partial class InstructionParser
 {
-    [GeneratedRegex(@"%(?<instructions>[^%]+)%", RegexOptions.None, "en-US")]
+    // Matches %instructions% where instructions:
+    // - Cannot start or end with whitespace
+    // - Must contain at least one alphabetic character (to avoid matching numbers like %50%)
+    // - Cannot contain percent signs
+    [GeneratedRegex(@"%(?<instructions>(?=[^%]*[a-zA-Z])[^%\s][^%]*[^%\s]|[a-zA-Z])%", RegexOptions.None, "en-US")]
     private static partial Regex InstructionsPattern();
 
     /// <summary>
@@ -25,7 +29,14 @@ public static partial class InstructionParser
         }
 
         var instructions = match.Groups["instructions"].Value;
-        var cleanedText = message.Remove(match.Index, match.Length).Trim();
-        return (cleanedText, instructions);
+        
+        // Remove the matched instruction and clean up surrounding whitespace
+        var beforeMatch = message[..match.Index].TrimEnd();
+        var afterMatch = message[(match.Index + match.Length)..].TrimStart();
+        var cleanedText = beforeMatch.Length > 0 && afterMatch.Length > 0 
+            ? $"{beforeMatch} {afterMatch}" 
+            : $"{beforeMatch}{afterMatch}";
+        
+        return (cleanedText.Trim(), instructions);
     }
 }

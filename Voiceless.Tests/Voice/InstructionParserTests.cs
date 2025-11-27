@@ -44,8 +44,8 @@ public class InstructionParserTests
         
         var (text, instructions) = InstructionParser.ExtractInstructions(message);
         
-        // Note: Double space remains where the instruction was removed
-        await Assert.That(text).IsEqualTo("Hello  world!");
+        // Whitespace is cleaned up properly
+        await Assert.That(text).IsEqualTo("Hello world!");
         await Assert.That(instructions).IsEqualTo("excitedly");
     }
 
@@ -67,10 +67,9 @@ public class InstructionParserTests
         
         var (text, instructions) = InstructionParser.ExtractInstructions(message);
         
-        // This will match "to 75" as instructions since there are two %s
-        // Wait, let me re-check the regex - it matches %...% where ... contains no %
-        // So "50% to 75%" would match " to 75" as the instructions
-        await Assert.That(instructions).IsEqualTo(" to 75");
+        // Should NOT match because " to 75" starts with a space (not a valid instruction format)
+        await Assert.That(text).IsEqualTo("I went from 50% to 75% today");
+        await Assert.That(instructions).IsNull();
     }
 
     [Test]
@@ -114,7 +113,7 @@ public class InstructionParserTests
         
         var (text, instructions) = InstructionParser.ExtractInstructions(message);
         
-        // Empty instructions %% should not match since [^%]+ requires at least one character
+        // Empty instructions %% should not match
         await Assert.That(text).IsEqualTo("Hello %% World");
         await Assert.That(instructions).IsNull();
     }
@@ -137,7 +136,42 @@ public class InstructionParserTests
         
         var (text, instructions) = InstructionParser.ExtractInstructions(message);
         
+        // Whitespace-only input with no instructions returns unchanged
         await Assert.That(text).IsEqualTo("   ");
         await Assert.That(instructions).IsNull();
+    }
+
+    [Test]
+    public async Task ExtractInstructions_SingleLetter_MatchesCorrectly()
+    {
+        var message = "%A% Hello";
+        
+        var (text, instructions) = InstructionParser.ExtractInstructions(message);
+        
+        await Assert.That(text).IsEqualTo("Hello");
+        await Assert.That(instructions).IsEqualTo("A");
+    }
+
+    [Test]
+    public async Task ExtractInstructions_NumbersOnly_DoesNotMatch()
+    {
+        var message = "%123% Hello";
+        
+        var (text, instructions) = InstructionParser.ExtractInstructions(message);
+        
+        // Numbers-only should not match as they need at least one letter
+        await Assert.That(text).IsEqualTo("%123% Hello");
+        await Assert.That(instructions).IsNull();
+    }
+
+    [Test]
+    public async Task ExtractInstructions_MixedAlphaNumeric_Matches()
+    {
+        var message = "%soft1% Hello";
+        
+        var (text, instructions) = InstructionParser.ExtractInstructions(message);
+        
+        await Assert.That(text).IsEqualTo("Hello");
+        await Assert.That(instructions).IsEqualTo("soft1");
     }
 }
