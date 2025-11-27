@@ -6,8 +6,11 @@
 
 - **Language**: C# 13 with .NET 10.0
 - **Type**: Console application (Discord bot)
-- **Size**: Small (~12 source files)
 - **External Dependencies**: OpenAI API, ElevenLabs API (optional), Discord Bot Token, FFmpeg (runtime)
+
+## Development Tip
+
+- When using the NetCord library you should make use of [the API documentation](https://netcord.dev/docs/).
 
 ## Build Instructions
 

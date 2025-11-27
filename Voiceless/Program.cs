@@ -163,7 +163,7 @@ public static partial class Program
         {
             await _discord.UpdatePresenceAsync(new PresenceProperties(UserStatusType.Online)
             {
-                Activities = [new UserActivityProperties($"v{displayVersion}", UserActivityType.Playing)]
+                Activities = [new UserActivityProperties($"Voiceless v{displayVersion} 🎙️", UserActivityType.Playing)]
             });
             Log.Information("Set bot presence to version: v{Version}", displayVersion);
         }
