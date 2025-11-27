@@ -428,9 +428,10 @@ public static partial class Program
         Log.Debug("VoiceStateUpdate: Processing for guild {GuildName}", guild.Name);
         
         // Set nickname if an update is needed
-        await SetNickname(guild);
+        await SetNickname(guild, voiceState);
 
-        var target = await GetTargetChannel(guild);
+        // Pass the incoming voice state to ensure we use the most current state for this user
+        var target = await GetTargetChannel(guild, voiceState);
         
         if (target is null)
         {
@@ -455,12 +456,22 @@ public static partial class Program
         await ConnectToVoiceChannel(voiceState.GuildId, target.Id);
     }
 
-    private static Task<IGuildChannel?> GetTargetChannel(Guild guild)
+    private static Task<IGuildChannel?> GetTargetChannel(Guild guild, VoiceState? overrideVoiceState = null)
     {
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
         
+        // Build effective voice states by starting with cached states
+        // and applying the override if provided (to handle cache not being updated yet)
+        var effectiveVoiceStates = guild.VoiceStates.Values.ToList();
+        if (overrideVoiceState != null)
+        {
+            // Remove any cached state for this user and use the override instead
+            effectiveVoiceStates.RemoveAll(vs => vs.UserId == overrideVoiceState.UserId);
+            effectiveVoiceStates.Add(overrideVoiceState);
+        }
+        
         // Get voice channel IDs where users of interest are present
-        var voiceChannelIds = guild.VoiceStates.Values
+        var voiceChannelIds = effectiveVoiceStates
             .Where(vs => vs.ChannelId.HasValue && users.Contains(vs.UserId))
             .Select(vs => vs.ChannelId!.Value)
             .Distinct()
@@ -476,7 +487,7 @@ public static partial class Program
             .Select(channel =>
             {
                 // Find users in this voice channel from voice states
-                var usersInChannel = guild.VoiceStates.Values
+                var usersInChannel = effectiveVoiceStates
                     .Where(vs => vs.ChannelId == channel.Id && users.Contains(vs.UserId))
                     .ToList();
                 
@@ -525,11 +536,20 @@ public static partial class Program
         await SetNickname(guild);
     }
 
-    private static async Task SetNickname(Guild guild)
+    private static async Task SetNickname(Guild guild, VoiceState? overrideVoiceState = null)
     {
         // Get target channel, if any, if none is found don't go further
-        var targetChannel = await GetTargetChannel(guild);
+        var targetChannel = await GetTargetChannel(guild, overrideVoiceState);
         var users = UsersOfInterestForServer(guild.Id).ToHashSet();
+        
+        // Build effective voice states by starting with cached states
+        // and applying the override if provided
+        var effectiveVoiceStates = guild.VoiceStates.Values.ToList();
+        if (overrideVoiceState != null)
+        {
+            effectiveVoiceStates.RemoveAll(vs => vs.UserId == overrideVoiceState.UserId);
+            effectiveVoiceStates.Add(overrideVoiceState);
+        }
         
         string nickname;
         if (targetChannel is null)
@@ -540,7 +560,7 @@ public static partial class Program
         else
         {
             // Get target users in this channel from voice states
-            var targetUsers = guild.VoiceStates.Values
+            var targetUsers = effectiveVoiceStates
                 .Where(vs => vs.ChannelId == targetChannel.Id && 
                             users.Contains(vs.UserId) && 
                             !vs.IsSelfDeafened && 
