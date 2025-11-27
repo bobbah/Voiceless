@@ -157,6 +157,21 @@ public static partial class Program
         Log.Information("Discord Ready event received. Bot user: {Username}#{Discriminator}", 
             args.User.Username, args.User.Discriminator);
         
+        // Set bot presence with version
+        var displayVersion = GetDisplayVersion();
+        try
+        {
+            await _discord.UpdatePresenceAsync(new PresenceProperties(UserStatusType.Online)
+            {
+                Activities = [new UserActivityProperties($"v{displayVersion}", UserActivityType.Playing)]
+            });
+            Log.Information("Set bot presence to version: v{Version}", displayVersion);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to set bot presence to version: v{Version}", displayVersion);
+        }
+        
         var targetConfig = GetConfiguration<TargetConfiguration>("target");
 
         // Update nickname in target servers
@@ -973,5 +988,21 @@ public static partial class Program
                       ?? assembly.GetName().Version?.ToString()
                       ?? "Unknown";
         return version;
+    }
+
+    /// <summary>
+    /// Gets the version string suitable for display, with the commit hash suffix trimmed.
+    /// MinVer generates versions like "0.3.2-alpha.0.1+commitHash", 
+    /// and this method returns "0.3.2-alpha.0.1" (without the "+commitHash" part).
+    /// </summary>
+    private static string GetDisplayVersion()
+    {
+        var version = GetVersionInfo();
+        if (string.IsNullOrEmpty(version))
+            return "Unknown";
+        
+        // Trim the commit hash suffix (everything after '+')
+        var plusIndex = version.IndexOf('+');
+        return plusIndex >= 0 ? version[..plusIndex] : version;
     }
 }
